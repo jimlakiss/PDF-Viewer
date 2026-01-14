@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PDF Viewer – Sidebar & Zoom</title>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div id="sidebar"></div>
+
+  <div id="main">
+    <div id="toolbar">
+      <input type="file" id="file-input" accept="application/pdf" />
+      <button id="zoom-out">−</button>
+      <button id="zoom-in">+</button>
+      <span id="page-indicator">Page – / –</span>
+    </div>
+
+    <div id="viewer">
+      <div id="pdf-scroll">
+        <div id="pdf-container">
+          <svg id="overlay"></svg>
+          <canvas id="pdf-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="pdf_viewer.js"></script>
+</body>
+</html>
