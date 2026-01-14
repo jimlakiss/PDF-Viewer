@@ -95,3 +95,9 @@ canvas {
   stroke: #0078ff;
   stroke-width: 2;
 }
+
+#overlay rect.selected {
+  stroke: #ff3b30;
+  stroke-width: 3;
+  fill: rgba(255, 59, 48, 0.15);
+}

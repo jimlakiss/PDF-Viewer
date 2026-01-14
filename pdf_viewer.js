@@ -1,5 +1,5 @@
 // pdf_viewer.js
-// Step 2B.b — Region storage + redraw (NO new UI)
+// Step 2C — Region selection + delete
 
 const fileInput = document.getElementById("file-input");
 const canvas = document.getElementById("pdf-canvas");
@@ -22,10 +22,12 @@ let currentPage = 1;
 let scale = 1.5;
 
 /* ============================================================
-   REGION STATE (per-page, normalised coords)
+   REGION STATE
    ============================================================ */
 
-const regionsByPage = {}; // { pageNum: [ {x,y,w,h}, ... ] }
+const regionsByPage = {}; // { pageNum: [ {id,x,y,w,h}, ... ] }
+let selectedRegionId = null;
+let regionIdCounter = 1;
 
 /* ============================================================
    DRAWING STATE
@@ -60,6 +62,7 @@ fileInput.addEventListener("change", async (e) => {
 
 async function renderPage(pageNum) {
   currentPage = pageNum;
+  selectedRegionId = null;
 
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
@@ -67,7 +70,6 @@ async function renderPage(pageNum) {
   canvas.width = viewport.width;
   canvas.height = viewport.height;
 
-  // Keep overlay in sync with canvas pixel space
   overlay.setAttribute("width", viewport.width);
   overlay.setAttribute("height", viewport.height);
 
@@ -99,7 +101,6 @@ zoomOutBtn.onclick = () => {
 
 async function buildThumbnails() {
   sidebar.innerHTML = "";
-
   for (let i = 1; i <= pdfDoc.numPages; i++) {
     const page = await pdfDoc.getPage(i);
     const viewport = page.getViewport({ scale: 0.2 });
@@ -122,22 +123,21 @@ function highlightActiveThumb() {
 }
 
 /* ============================================================
-   REGION DRAWING (RECTANGLES) — works because CSS now allows pointer events
+   REGION DRAWING
    ============================================================ */
 
 overlay.addEventListener("mousedown", (e) => {
+  // If clicking existing rect, selection logic handles it
+  if (e.target.tagName === "rect") return;
+
   isDrawing = true;
+  selectedRegionId = null;
 
   const r = overlay.getBoundingClientRect();
   startX = e.clientX - r.left;
   startY = e.clientY - r.top;
 
   activeRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  activeRect.setAttribute("x", startX);
-  activeRect.setAttribute("y", startY);
-  activeRect.setAttribute("width", 0);
-  activeRect.setAttribute("height", 0);
-
   overlay.appendChild(activeRect);
 });
 
@@ -145,18 +145,18 @@ overlay.addEventListener("mousemove", (e) => {
   if (!isDrawing || !activeRect) return;
 
   const r = overlay.getBoundingClientRect();
-  const currentX = e.clientX - r.left;
-  const currentY = e.clientY - r.top;
+  const x = e.clientX - r.left;
+  const y = e.clientY - r.top;
 
-  const x = Math.min(startX, currentX);
-  const y = Math.min(startY, currentY);
-  const w = Math.abs(currentX - startX);
-  const h = Math.abs(currentY - startY);
+  const rx = Math.min(startX, x);
+  const ry = Math.min(startY, y);
+  const rw = Math.abs(x - startX);
+  const rh = Math.abs(y - startY);
 
-  activeRect.setAttribute("x", x);
-  activeRect.setAttribute("y", y);
-  activeRect.setAttribute("width", w);
-  activeRect.setAttribute("height", h);
+  activeRect.setAttribute("x", rx);
+  activeRect.setAttribute("y", ry);
+  activeRect.setAttribute("width", rw);
+  activeRect.setAttribute("height", rh);
 });
 
 overlay.addEventListener("mouseup", () => {
@@ -164,12 +164,11 @@ overlay.addEventListener("mouseup", () => {
 
   isDrawing = false;
 
-  const x = parseFloat(activeRect.getAttribute("x"));
-  const y = parseFloat(activeRect.getAttribute("y"));
-  const w = parseFloat(activeRect.getAttribute("width"));
-  const h = parseFloat(activeRect.getAttribute("height"));
+  const x = +activeRect.getAttribute("x");
+  const y = +activeRect.getAttribute("y");
+  const w = +activeRect.getAttribute("width");
+  const h = +activeRect.getAttribute("height");
 
-  // Ignore accidental clicks (tiny rectangles)
   if (w < 2 || h < 2) {
     activeRect.remove();
     activeRect = null;
@@ -177,6 +176,7 @@ overlay.addEventListener("mouseup", () => {
   }
 
   const region = {
+    id: regionIdCounter++,
     x: x / canvas.width,
     y: y / canvas.height,
     w: w / canvas.width,
@@ -186,47 +186,66 @@ overlay.addEventListener("mouseup", () => {
   if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
   regionsByPage[currentPage].push(region);
 
-  console.log("📐 Region (normalised):", { page: currentPage, ...region });
-  console.log("📦 regionsByPage:", regionsByPage);
-
   activeRect = null;
-
   redrawRegions();
 });
 
 /* ============================================================
-   REDRAW REGIONS (per page)
+   REDRAW REGIONS + SELECTION
    ============================================================ */
 
 function redrawRegions() {
-  // Clear overlay and redraw all committed regions for this page
   overlay.innerHTML = "";
 
   const regions = regionsByPage[currentPage];
-  if (!regions || regions.length === 0) return;
+  if (!regions) return;
 
-  for (const r of regions) {
+  regions.forEach((r) => {
     const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     rect.setAttribute("x", r.x * canvas.width);
     rect.setAttribute("y", r.y * canvas.height);
     rect.setAttribute("width", r.w * canvas.width);
     rect.setAttribute("height", r.h * canvas.height);
+    rect.dataset.id = r.id;
+
+    if (r.id === selectedRegionId) {
+      rect.classList.add("selected");
+    }
+
+    rect.addEventListener("mousedown", (e) => {
+      e.stopPropagation();
+      selectedRegionId = r.id;
+      redrawRegions();
+    });
+
     overlay.appendChild(rect);
-  }
+  });
 }
 
 /* ============================================================
-   MOUSEWHEEL: PAN + ZOOM
-   - Shift disabled (bug guard)
-   - Ctrl = horizontal
-   - Option/Alt = vertical
-   - Otherwise zoom-to-cursor
-   NOTE: Listener attached to BOTH pdfScroll and overlay (wheel-safe).
+   DELETE SELECTED REGION
    ============================================================ */
 
-function onWheel(e) {
-  e.preventDefault();
+window.addEventListener("keydown", (e) => {
+  if ((e.key === "Delete" || e.key === "Backspace") && selectedRegionId) {
+    const regions = regionsByPage[currentPage];
+    if (!regions) return;
 
+    regionsByPage[currentPage] =
+      regions.filter((r) => r.id !== selectedRegionId);
+
+    selectedRegionId = null;
+    redrawRegions();
+    e.preventDefault();
+  }
+});
+
+/* ============================================================
+   MOUSEWHEEL: PAN + ZOOM (unchanged)
+   ============================================================ */
+
+pdfScroll.addEventListener("wheel", (e) => {
+  e.preventDefault();
   if (e.shiftKey) return;
 
   const PAN_MULT = 3;
@@ -258,16 +277,4 @@ function onWheel(e) {
     pdfScroll.scrollLeft = px * scale - mx;
     pdfScroll.scrollTop = py * scale - my;
   });
-}
-
-pdfScroll.addEventListener("wheel", onWheel, { passive: false });
-overlay.addEventListener("wheel", onWheel, { passive: false });
-
-/* ============================================================
-   PREVENT PAGE KEYS
-   ============================================================ */
-
-window.addEventListener("keydown", (e) => {
-  const blocked = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"];
-  if (blocked.includes(e.key)) e.preventDefault();
-});
+}, { passive: false });
