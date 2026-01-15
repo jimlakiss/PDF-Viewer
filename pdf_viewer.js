@@ -5,7 +5,7 @@
 // ============================================================
 
 // Vector extraction toggle (OCR-only when false)
-const ENABLE_VECTOR_EXTRACTION = true;
+const ENABLE_VECTOR_EXTRACTION = false;
 
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 
@@ -112,6 +112,20 @@ async function getOcrWorker() {
 
   return ocrWorkerPromise;
 }
+
+
+/* ============================================================
+   OCR JOB QUEUE (prevents concurrent setParameters/recognize races)
+   ============================================================ */
+
+let _ocrJobChain = Promise.resolve();
+
+function runOcrExclusive(fn) {
+  // Ensures only one OCR job runs at a time on the shared worker.
+  _ocrJobChain = _ocrJobChain.then(fn, fn);
+  return _ocrJobChain;
+}
+
 
 /* ============================================================
    INIT UI
@@ -778,6 +792,145 @@ function promoteRegionToTemplate(region) {
   console.log(`📐 Template set for "${region.type}"`, regionTemplates[region.type]);
 }
 
+
+
+/* ============================================================
+   OCR POST-PROCESSING + MULTI-PASS (PSM)
+   - Minimal additions to improve OCR robustness
+   ============================================================ */
+
+function isIdLikeField(field) {
+  return field === "sheet_id" || field === "issue_id" || field === "project_id" || field === "date";
+}
+
+/**
+ * Field-specific preprocessing:
+ * - Always grayscale
+ * - ONLY threshold for ID-like fields (ids/dates). Text fields keep grayscale to preserve antialiasing.
+ */
+function preprocessOcrCrop(canvasEl, field) {
+  try {
+    const c = canvasEl.getContext("2d");
+    const img = c.getImageData(0, 0, canvasEl.width, canvasEl.height);
+    const d = img.data;
+
+    // grayscale
+    for (let i = 0; i < d.length; i += 4) {
+      const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+      d[i] = d[i + 1] = d[i + 2] = g;
+    }
+
+    // threshold only for id-like fields
+    if (isIdLikeField(field)) {
+      const TH = 180;
+      for (let i = 0; i < d.length; i += 4) {
+        const v = d[i] > TH ? 255 : 0;
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+    }
+
+    c.putImageData(img, 0, 0);
+  } catch (_) {
+    // If anything fails (rare), fall back to raw crop.
+  }
+}
+
+function _normText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function cleanByField(field, raw) {
+  const t = _normText(raw);
+  if (!t) return "";
+
+  if (field === "date") {
+    // First date-like token (AU drawings often use dd/mm/yyyy or dd-mm-yy)
+    const m = t.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/);
+    return m ? m[1] : t;
+  }
+
+  if (field === "issue_id") {
+    // If OCR captured a date too, strip it first, then keep the most "id-ish" token.
+    const withoutDate = t.replace(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g, " ").trim();
+    const m = withoutDate.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
+    return m ? m[0] : (withoutDate || t);
+  }
+
+  if (field === "sheet_id") {
+    // Prefer compact token (common formats: A101, 00, SK-01, etc.)
+    const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
+    return m ? m[0] : t;
+  }
+
+  if (field === "project_id") {
+    const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.\/]+/);
+    return m ? m[0] : t;
+  }
+
+  // prepared_by, description, issue_description: keep normalized text
+  return t;
+}
+
+function _ocrPassConfigs(field) {
+  // Keep it small (OCR is expensive across many pages).
+  // IDs/dates: prefer single-line then block.
+  if (field === "sheet_id" || field === "issue_id" || field === "project_id") {
+    return [
+      { psm: "7", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "line" },
+      { psm: "6", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "block" },
+    ];
+  }
+
+  if (field === "date") {
+    return [
+      { psm: "7", whitelist: "0123456789/.-", label: "line" },
+      { psm: "6", whitelist: "0123456789/.-", label: "block" },
+    ];
+  }
+
+  // Text fields (names/descriptions): no whitelist, preserve antialiasing (no hard threshold).
+  return [
+    { psm: "6", whitelist: null, label: "block" },
+    { psm: "11", whitelist: null, label: "sparse" },
+  ];
+}
+
+async function _setOcrParams(worker, field, psm, whitelist) {
+  const params = {
+    user_defined_dpi: "300",
+    preserve_interword_spaces: "1",
+    tessedit_pageseg_mode: String(psm || "6"),
+  };
+  if (whitelist) params.tessedit_char_whitelist = whitelist;
+  await worker.setParameters(params);
+}
+
+function _scoreOcrCandidate(text, confidence) {
+  // Confidence is sometimes 0/NaN in tesseract.js; combine with length as a tiebreaker.
+  const c = Number.isFinite(confidence) ? confidence : 0;
+  const len = _normText(text).length;
+  return (c * 1000) + Math.min(200, len);
+}
+
+async function ocrRecognizeMultiPass(worker, blob, field) {
+  const passes = _ocrPassConfigs(field);
+  let best = { text: "", confidence: 0, psm: null, label: null, score: -Infinity };
+
+  for (const pass of passes) {
+    await _setOcrParams(worker, field, pass.psm, pass.whitelist);
+    const { data } = await worker.recognize(blob);
+    const text = _normText(data?.text || "");
+    const confidence = Number(data?.confidence) || 0;
+
+    const score = _scoreOcrCandidate(text, confidence);
+    if (score > best.score) {
+      best = { text, confidence, psm: pass.psm, label: pass.label, score };
+    }
+  }
+
+  return best;
+}
+
 /* ============================================================
    VECTOR EXTRACTION (kept, but OCR is used in Extract All)
    ============================================================ */
@@ -843,49 +996,21 @@ async function extractOCRFromRegion(pageNum, region) {
     crop.height
   );
 
+  const field = (region && region.type) ? region.type : "";
+  preprocessOcrCrop(crop, field);
+
   const worker = await getOcrWorker();
+
   const blob = await new Promise((res) => crop.toBlob(res, "image/png"));
-  
-  
-  // Tune Tesseract per field (PSM, DPI, spacing, whitelist)
-  
-    async function setOcrProfile(worker, fieldType) {
-    const common = {
-      user_defined_dpi: "300",
-      preserve_interword_spaces: "1",
-    };
+  if (!blob) return "";
 
-    // Page Segmentation Mode: try 6 or 7 most often
-    // (6 = block of text, 7 = single line).  [oai_citation:1‡muthu.co](https://muthu.co/all-tesseract-ocr-options/?utm_source=chatgpt.com)
-    if (fieldType === "sheet_id" || fieldType === "issue_id") {
-      await worker.setParameters({
-        ...common,
-        tessedit_pageseg_mode: "7",
-        tessedit_char_whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_.",
-      });
-      return;
-    }
-
-    if (fieldType === "date") {
-      await worker.setParameters({
-        ...common,
-        tessedit_pageseg_mode: "7",
-        tessedit_char_whitelist: "0123456789/.-",
-      });
-      return;
-    }
-
-    // General text (description, issue_description, prepared_by, project_id)
-    await worker.setParameters({
-      ...common,
-      tessedit_pageseg_mode: "6",
-    });
-  }
-
-  const { data } = await worker.recognize(blob);
-
-  return (data.text || "").replace(/\s+/g, " ").trim();
+  // Multi-pass OCR (vary PSM) then field-specific cleanup
+  return await runOcrExclusive(async () => {
+    const best = await ocrRecognizeMultiPass(worker, blob, field);
+    return cleanByField(field, best.text);
+  });
 }
+
 
 /* ============================================================
    APPLY TEMPLATES TO ALL PAGES (Step 3)
@@ -900,7 +1025,7 @@ async function applyTemplatesToAllPages(logProgress = false) {
     if (!sheetDetailsByPage[pageNum]) sheetDetailsByPage[pageNum] = {};
 
     for (const field of REGION_TYPES) {
-      if (sheetDetailsByPage[pageNum][field]) continue;
+      if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) continue;
 
       const region = resolveRegionForPage(pageNum, field);
       if (!region) continue;
@@ -915,6 +1040,7 @@ async function applyTemplatesToAllPages(logProgress = false) {
       extracted = await extractOCRFromRegion(pageNum, region);
 }
 
+      extracted = cleanByField(field, extracted);
       sheetDetailsByPage[pageNum][field] = extracted || "";
     }
   }
@@ -945,12 +1071,16 @@ async function extractAll() {
     let extracted = await extractOCRFromRegion(currentPage, region);
     extracted = (extracted || "").trim();
 
-    documentDetails[field] = extracted;
+    if (extracted) {
+      documentDetails[field] = extracted;
+      if (field === "prepared_by" && preparedByInput) preparedByInput.value = extracted;
+      if (field === "project_id" && projectIdInput) projectIdInput.value = extracted;
+    } else {
+      // Don't overwrite a previously-good value with an empty/failed read
+      console.warn(`⚠️ Document field (${field}) read empty; keeping existing value`, documentDetails[field] || "<empty>");
+    }
 
-    if (field === "prepared_by" && preparedByInput) preparedByInput.value = extracted;
-    if (field === "project_id" && projectIdInput) projectIdInput.value = extracted;
-
-    console.log(`📄 Document field (${field}) →`, extracted || "<empty>");
+    console.log(`📄 Document field (${field}) →`, (documentDetails[field] || "").trim() || "<empty>");
   }
 
   // 2) Sheet fields on current page (promote to templates)
@@ -962,7 +1092,16 @@ async function extractAll() {
     extracted = (extracted || "").trim();
 
     if (!sheetDetailsByPage[currentPage]) sheetDetailsByPage[currentPage] = {};
-    sheetDetailsByPage[currentPage][field] = extracted;
+    const hadValue = Object.prototype.hasOwnProperty.call(sheetDetailsByPage[currentPage], field) && (sheetDetailsByPage[currentPage][field] || "").trim();
+    if (extracted) {
+      sheetDetailsByPage[currentPage][field] = extracted;
+    } else if (!hadValue) {
+      // Cache the empty result so we don't keep re-OCRing until geometry changes
+      sheetDetailsByPage[currentPage][field] = "";
+      console.warn(`⚠️ Sheet field (master) (${field}) read empty`);
+    } else {
+      console.warn(`⚠️ Sheet field (master) (${field}) read empty; keeping existing value`, sheetDetailsByPage[currentPage][field]);
+    }
 
     // promoteRegionToTemplate(region);
 
@@ -974,7 +1113,7 @@ async function extractAll() {
       promoteRegionToTemplate(region);
     }
 
-    console.log(`📄 Sheet field (master) (${field}) →`, extracted || "<empty>");
+    console.log(`📄 Sheet field (master) (${field}) →`, (sheetDetailsByPage[currentPage]?.[field] || "").trim() || "<empty>");
   }
 
   // 3) Apply templates to all pages (progress in console)
