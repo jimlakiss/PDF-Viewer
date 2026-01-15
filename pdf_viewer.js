@@ -35,6 +35,13 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 /* ============================================================
+   REGION TEMPLATES (Feature 1 — Step 1)
+   ============================================================ */
+
+// One template per sheet-level field (geometry only, normalised)
+const regionTemplates = {};
+
+/* ============================================================
    STATE
    ============================================================ */
 
@@ -65,7 +72,6 @@ async function getOcrWorker() {
     throw new Error("Tesseract.createWorker not available");
   }
 
-  // Keep your explicit paths (but call createWorker with signatures that match the runtime)
   const workerOptions = {
     workerPath: "https://unpkg.com/tesseract.js@5.0.4/dist/worker.min.js",
     corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
@@ -76,44 +82,31 @@ async function getOcrWorker() {
     let worker = null;
     const errors = [];
 
-    // Signature A (common in v5 builds): createWorker('eng', oem?, options?)
     try {
-      // OEM 1 = LSTM only (most common). Some builds accept (lang, options) too, so we try both.
       worker = await Tesseract.createWorker("eng", 1, workerOptions);
       return worker;
-    } catch (e) {
-      errors.push(e);
-    }
+    } catch (e) { errors.push(e); }
 
     try {
       worker = await Tesseract.createWorker("eng", workerOptions);
       return worker;
-    } catch (e) {
-      errors.push(e);
-    }
+    } catch (e) { errors.push(e); }
 
-    // Signature B (older style): createWorker(options) then loadLanguage/initialize
     try {
       worker = await Tesseract.createWorker(workerOptions);
       await worker.loadLanguage("eng");
       await worker.initialize("eng");
       return worker;
-    } catch (e) {
-      errors.push(e);
-    }
+    } catch (e) { errors.push(e); }
 
-    // Signature C (fallback): createWorker() then loadLanguage/initialize
-    // (useful if the CDN build ignores/doesn't like custom paths)
     try {
       worker = await Tesseract.createWorker();
       await worker.loadLanguage("eng");
       await worker.initialize("eng");
       return worker;
-    } catch (e) {
-      errors.push(e);
-    }
+    } catch (e) { errors.push(e); }
 
-    console.error("OCR worker init failed. Tried multiple createWorker signatures.", errors);
+    console.error("OCR worker init failed", errors);
     throw errors[errors.length - 1];
   })();
 
@@ -337,7 +330,7 @@ function redrawRegions() {
 }
 
 /* ============================================================
-   VECTOR EXTRACTION
+   VECTOR EXTRACTION + FEATURE 1 HELPERS
    ============================================================ */
 
 function getMostRecentRegionOfType(pageNum, type) {
@@ -346,6 +339,40 @@ function getMostRecentRegionOfType(pageNum, type) {
     if (regions[i].type === type) return regions[i];
   }
   return null;
+}
+
+/* ============================================================
+   FEATURE 1 HELPERS (templates + overrides)
+   ============================================================ */
+
+// Resolve region geometry for a page:
+//   1) page-specific override (most recent)
+//   2) template
+//   3) null
+function resolveRegionForPage(pageNum, type) {
+  const pageRegions = regionsByPage[pageNum] || [];
+  const override = [...pageRegions].reverse().find(r => r.type === type);
+  if (override) return override;
+
+  if (regionTemplates[type]) return regionTemplates[type];
+
+  return null;
+}
+
+// Promote region geometry to a template (geometry only, normalised).
+// Note: this does not affect any existing page-specific overrides.
+function promoteRegionToTemplate(region) {
+  if (!region || !region.type) return;
+
+  regionTemplates[region.type] = {
+    type: region.type,
+    x: region.x,
+    y: region.y,
+    w: region.w,
+    h: region.h,
+  };
+
+  console.log(`📐 Template set for "${region.type}"`, regionTemplates[region.type]);
 }
 
 async function extractVectorTextFromRegion(pageNum, region) {
@@ -410,9 +437,7 @@ async function extractOCRFromRegion(pageNum, region) {
     crop.toBlob(resolve, "image/png")
   );
 
-  if (!blob) {
-    throw new Error("OCR crop.toBlob() returned null (canvas empty or unsupported).");
-  }
+  if (!blob) throw new Error("OCR crop.toBlob() returned null");
 
   const { data } = await worker.recognize(blob);
 
