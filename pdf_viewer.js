@@ -5,7 +5,7 @@
 // ============================================================
 
 // Vector extraction toggle (OCR-only when false)
-const ENABLE_VECTOR_EXTRACTION = true;
+const ENABLE_VECTOR_EXTRACTION = false;
 
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 
@@ -68,9 +68,6 @@ let clipboardBase = null; // {minX, minY} of copied group
 let clipboardPasteSerial = 0;
 let regionIdCounter = 1;
 
-// Last mouse pointer position over the PDF canvas (normalized 0..1)
-let lastPointerNorm = null;
-
 /* ============================================================
    OCR WORKER (robust)
    ============================================================ */
@@ -112,20 +109,6 @@ async function getOcrWorker() {
 
   return ocrWorkerPromise;
 }
-
-
-/* ============================================================
-   OCR JOB QUEUE (prevents concurrent setParameters/recognize races)
-   ============================================================ */
-
-let _ocrJobChain = Promise.resolve();
-
-function runOcrExclusive(fn) {
-  // Ensures only one OCR job runs at a time on the shared worker.
-  _ocrJobChain = _ocrJobChain.then(fn, fn);
-  return _ocrJobChain;
-}
-
 
 /* ============================================================
    INIT UI
@@ -309,7 +292,6 @@ let activeRect = null;
 let isDraggingRegions = false;
 let dragStartPx = { x: 0, y: 0 };
 let dragHasMoved = false;
-
 let dragClickShouldToggleOff = false; // only for single-select re-click
 let dragStartById = new Map(); // id -> {x,y,w,h}
 
@@ -317,27 +299,6 @@ function getOverlayPoint(evt) {
   const r = overlay.getBoundingClientRect();
   return { x: evt.clientX - r.left, y: evt.clientY - r.top };
 }
-
-// Track last pointer position over the overlay for "Shift+Paste at pointer"
-function updateLastPointerNormFromEvent(evt) {
-  if (!overlay) return;
-  const r = overlay.getBoundingClientRect();
-  const xPx = evt.clientX - r.left;
-  const yPx = evt.clientY - r.top;
-
-  // only update when pointer is over the overlay
-  if (xPx < 0 || yPx < 0 || xPx > r.width || yPx > r.height) return;
-
-  const x = r.width ? xPx / r.width : 0;
-  const y = r.height ? yPx / r.height : 0;
-
-  const cx = x < 0 ? 0 : x > 1 ? 1 : x;
-  const cy = y < 0 ? 0 : y > 1 ? 1 : y;
-  lastPointerNorm = { x: cx, y: cy };
-}
-
-// Passive global listener so Shift+Cmd/Ctrl+V works without extra clicks
-window.addEventListener("mousemove", updateLastPointerNormFromEvent, { passive: true });
 
 function beginRegionDrag(evt, clickShouldToggleOff) {
   if (!overlay) return;
@@ -410,26 +371,6 @@ function onRegionDragEnd() {
   window.removeEventListener("mousemove", onRegionDragMove, true);
   window.removeEventListener("mouseup", onRegionDragEnd, true);
 
-  // If geometry changed, invalidate cached extraction results for the affected field types.
-  // This prevents "sticky" values when regions are moved.
-  if (dragHasMoved) {
-    const regs = regionsByPage[currentPage] || [];
-    const byId = new Map(regs.map((r) => [r.id, r]));
-    const changedTypes = [...new Set(
-      [...dragStartById.keys()].map((id) => byId.get(id)?.type).filter(Boolean)
-    )];
-
-    if (changedTypes.length) {
-      invalidatePageFields(currentPage, changedTypes);
-
-      // If we're editing the template master page, keep templates in sync and
-      // invalidate all pages so template-driven fields re-extract correctly.
-      if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-        syncTemplatesFromMaster(changedTypes);
-      }
-    }
-  }
-
   const shouldToggleOff = dragClickShouldToggleOff && !dragHasMoved;
 
   isDraggingRegions = false;
@@ -438,6 +379,11 @@ function onRegionDragEnd() {
 
   if (shouldToggleOff) {
     clearSelection();
+  }
+
+  if (dragHasMoved) {
+    const movedTypes = [...new Set(getSelectedRegionsOnCurrentPage().map((r) => r.type))].filter((t) => REGION_TYPES.includes(t));
+    invalidateSheetFields(currentPage, movedTypes);
   }
 
   redrawRegions();
@@ -500,15 +446,11 @@ overlay?.addEventListener("mouseup", () => {
 
   if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
   regionsByPage[currentPage].push(region);
-  
-  invalidatePageFields(currentPage, [region.type]);
 
-  // If the user is drawing/editing regions on the template master page, keep
-  // the template geometry (and all derived page caches) consistent immediately.
-  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-    syncTemplatesFromMaster([region.type]);
+  // If this is a sheet field, invalidate cached extraction for this page+field.
+  if (REGION_TYPES.includes(region.type)) {
+    invalidateSheetField(currentPage, region.type);
   }
-
 
   activeRect = null;
   redrawRegions();
@@ -602,6 +544,28 @@ function redrawRegions() {
    HELPERS
    ============================================================ */
 
+function invalidateSheetField(pageNum, field) {
+  if (!sheetDetailsByPage[pageNum]) return;
+  if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) {
+    delete sheetDetailsByPage[pageNum][field];
+  }
+}
+
+function invalidateSheetFields(pageNum, fields) {
+  if (!fields || !fields.length) return;
+  fields.forEach((f) => invalidateSheetField(pageNum, f));
+}
+
+// If a MASTER template changes geometry for a field, clear cached values for that
+// field on all pages so applyTemplatesToAllPages() will re-extract correctly.
+function invalidateSheetFieldAcrossAllPages(field) {
+  if (!pdfDoc || !field) return;
+  for (let p = 1; p <= pdfDoc.numPages; p++) {
+    invalidateSheetField(p, field);
+  }
+}
+
+
 function syncLegacySelectedId() {
   selectedRegionId =
     selectedRegionIds.length > 0
@@ -673,9 +637,6 @@ function copySelectionToClipboard() {
 function pasteClipboardToCurrentPage() {
   if (!clipboardRegions.length || !clipboardBase) return false;
 
-  const changedTypes = [...new Set(clipboardRegions.map(r => r.type))];
-  invalidatePageFields(currentPage, changedTypes);
-
   // Nudge each paste so it’s visible
   clipboardPasteSerial += 1;
   const nudgePx = 10 * clipboardPasteSerial;
@@ -715,116 +676,11 @@ function pasteClipboardToCurrentPage() {
 
   selectedRegionIds = newIds;
   syncLegacySelectedId();
+  const changedTypes = [...new Set(clipboardRegions.map((r) => r.type))].filter((t) => REGION_TYPES.includes(t));
+  invalidateSheetFields(currentPage, changedTypes);
   redrawRegions();
-
-  // If pasting on the template master page, update template geometry now.
-  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-    syncTemplatesFromMaster(changedTypes);
-  }
 
   console.log(`📋 Pasted ${newIds.length} region(s) onto page ${currentPage}`);
-  return true;
-}
-
-
-// Cache invalidation: if a region's geometry changes, cached OCR/vector results
-// MUST be cleared or you'll see "sticky" values.
-function invalidatePageFields(pageNum, types) {
-  if (!sheetDetailsByPage[pageNum]) return;
-  types.forEach((t) => {
-    if (t in sheetDetailsByPage[pageNum]) delete sheetDetailsByPage[pageNum][t];
-  });
-}
-
-function invalidateAllPagesForTypes(types) {
-  const numPages = pdfDoc?.numPages || 0;
-  for (let p = 1; p <= numPages; p++) {
-    invalidatePageFields(p, types);
-  }
-}
-
-function syncTemplatesFromMaster(types) {
-  if (TEMPLATE_MASTER_PAGE === null) return;
-  if (currentPage !== TEMPLATE_MASTER_PAGE) return;
-
-  types.forEach((type) => {
-    const latest = getMostRecentRegionOfType(TEMPLATE_MASTER_PAGE, type);
-
-    // If we still have a region of this type on the master, update template.
-    if (latest) {
-      promoteRegionToTemplate(latest);
-      return;
-    }
-
-    // If the last master region of this type was deleted, clear the template.
-    if (regionTemplates[type]) {
-      delete regionTemplates[type];
-      console.log(`📐 Template cleared for "${type}"`);
-    }
-  });
-
-  // Template changes affect *all* pages.
-  invalidateAllPagesForTypes(types);
-  redrawRegions();
-}
-
-
-
-
-function pasteClipboardToCurrentPageAtPointer() {
-  if (!clipboardRegions.length || !clipboardBase) return false;
-  if (!lastPointerNorm) return pasteClipboardToCurrentPage();
-
-  const changedTypes = [...new Set(clipboardRegions.map((r) => r.type))];
-  invalidatePageFields(currentPage, changedTypes);
-
-  // Align the group's top-left (clipboardBase) to the current pointer
-  let baseX = lastPointerNorm.x;
-  let baseY = lastPointerNorm.y;
-
-  // Clamp as a GROUP so the whole pasted set stays on-page
-  let groupMaxX = 0;
-  let groupMaxY = 0;
-  clipboardRegions.forEach((it) => {
-    groupMaxX = Math.max(groupMaxX, it.dx + it.w);
-    groupMaxY = Math.max(groupMaxY, it.dy + it.h);
-  });
-
-  baseX = Math.min(Math.max(baseX, 0), Math.max(0, 1 - groupMaxX));
-  baseY = Math.min(Math.max(baseY, 0), Math.max(0, 1 - groupMaxY));
-
-  if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
-
-  const newIds = [];
-
-  clipboardRegions.forEach((it) => {
-    const id = regionIdCounter++;
-
-    const x = baseX + it.dx;
-    const y = baseY + it.dy;
-
-    regionsByPage[currentPage].push({
-      id,
-      type: it.type,
-      x,
-      y,
-      w: it.w,
-      h: it.h,
-    });
-
-    newIds.push(id);
-  });
-
-  selectedRegionIds = newIds;
-  syncLegacySelectedId();
-  redrawRegions();
-
-  // If pasting on the template master page, update template geometry now.
-  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-    syncTemplatesFromMaster(changedTypes);
-  }
-
-  console.log(`📋 Pasted ${newIds.length} region(s) at pointer onto page ${currentPage}`);
   return true;
 }
 function getMostRecentRegionOfType(pageNum, type) {
@@ -846,7 +702,8 @@ function resolveRegionForPage(pageNum, type) {
 function promoteRegionToTemplate(region) {
   if (!region || !region.type) return;
 
-  regionTemplates[region.type] = {
+  const prev = regionTemplates[region.type];
+  const next = {
     type: region.type,
     x: region.x,
     y: region.y,
@@ -854,146 +711,24 @@ function promoteRegionToTemplate(region) {
     h: region.h,
   };
 
+  // Detect geometry change (tiny epsilon to avoid noise)
+  const EPS = 1e-9;
+  const changed =
+    !prev ||
+    Math.abs((prev.x ?? 0) - next.x) > EPS ||
+    Math.abs((prev.y ?? 0) - next.y) > EPS ||
+    Math.abs((prev.w ?? 0) - next.w) > EPS ||
+    Math.abs((prev.h ?? 0) - next.h) > EPS;
+
+  regionTemplates[region.type] = next;
+
+  // Critical: if the master template changed, cached per-page values must be
+  // cleared so Apply Templates re-extracts for all pages using the new region.
+  if (changed && typeof invalidateSheetFieldAcrossAllPages === "function") {
+    invalidateSheetFieldAcrossAllPages(region.type);
+  }
+
   console.log(`📐 Template set for "${region.type}"`, regionTemplates[region.type]);
-}
-
-
-
-/* ============================================================
-   OCR POST-PROCESSING + MULTI-PASS (PSM)
-   - Minimal additions to improve OCR robustness
-   ============================================================ */
-
-function isIdLikeField(field) {
-  return field === "sheet_id" || field === "issue_id" || field === "project_id" || field === "date";
-}
-
-/**
- * Field-specific preprocessing:
- * - Always grayscale
- * - ONLY threshold for ID-like fields (ids/dates). Text fields keep grayscale to preserve antialiasing.
- */
-function preprocessOcrCrop(canvasEl, field) {
-  try {
-    const c = canvasEl.getContext("2d");
-    const img = c.getImageData(0, 0, canvasEl.width, canvasEl.height);
-    const d = img.data;
-
-    // grayscale
-    for (let i = 0; i < d.length; i += 4) {
-      const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
-      d[i] = d[i + 1] = d[i + 2] = g;
-    }
-
-    // threshold only for id-like fields
-    if (isIdLikeField(field)) {
-      const TH = 180;
-      for (let i = 0; i < d.length; i += 4) {
-        const v = d[i] > TH ? 255 : 0;
-        d[i] = d[i + 1] = d[i + 2] = v;
-      }
-    }
-
-    c.putImageData(img, 0, 0);
-  } catch (_) {
-    // If anything fails (rare), fall back to raw crop.
-  }
-}
-
-function _normText(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
-}
-
-function cleanByField(field, raw) {
-  const t = _normText(raw);
-  if (!t) return "";
-
-  if (field === "date") {
-    // First date-like token (AU drawings often use dd/mm/yyyy or dd-mm-yy)
-    const m = t.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/);
-    return m ? m[1] : t;
-  }
-
-  if (field === "issue_id") {
-    // If OCR captured a date too, strip it first, then keep the most "id-ish" token.
-    const withoutDate = t.replace(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g, " ").trim();
-    const m = withoutDate.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
-    return m ? m[0] : (withoutDate || t);
-  }
-
-  if (field === "sheet_id") {
-    // Prefer compact token (common formats: A101, 00, SK-01, etc.)
-    const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
-    return m ? m[0] : t;
-  }
-
-  if (field === "project_id") {
-    const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.\/]+/);
-    return m ? m[0] : t;
-  }
-
-  // prepared_by, description, issue_description: keep normalized text
-  return t;
-}
-
-function _ocrPassConfigs(field) {
-  // Keep it small (OCR is expensive across many pages).
-  // IDs/dates: prefer single-line then block.
-  if (field === "sheet_id" || field === "issue_id" || field === "project_id") {
-    return [
-      { psm: "7", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "line" },
-      { psm: "6", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "block" },
-    ];
-  }
-
-  if (field === "date") {
-    return [
-      { psm: "7", whitelist: "0123456789/.-", label: "line" },
-      { psm: "6", whitelist: "0123456789/.-", label: "block" },
-    ];
-  }
-
-  // Text fields (names/descriptions): no whitelist, preserve antialiasing (no hard threshold).
-  return [
-    { psm: "6", whitelist: null, label: "block" },
-    { psm: "11", whitelist: null, label: "sparse" },
-  ];
-}
-
-async function _setOcrParams(worker, field, psm, whitelist) {
-  const params = {
-    user_defined_dpi: "300",
-    preserve_interword_spaces: "1",
-    tessedit_pageseg_mode: String(psm || "6"),
-  };
-  if (whitelist) params.tessedit_char_whitelist = whitelist;
-  await worker.setParameters(params);
-}
-
-function _scoreOcrCandidate(text, confidence) {
-  // Confidence is sometimes 0/NaN in tesseract.js; combine with length as a tiebreaker.
-  const c = Number.isFinite(confidence) ? confidence : 0;
-  const len = _normText(text).length;
-  return (c * 1000) + Math.min(200, len);
-}
-
-async function ocrRecognizeMultiPass(worker, blob, field) {
-  const passes = _ocrPassConfigs(field);
-  let best = { text: "", confidence: 0, psm: null, label: null, score: -Infinity };
-
-  for (const pass of passes) {
-    await _setOcrParams(worker, field, pass.psm, pass.whitelist);
-    const { data } = await worker.recognize(blob);
-    const text = _normText(data?.text || "");
-    const confidence = Number(data?.confidence) || 0;
-
-    const score = _scoreOcrCandidate(text, confidence);
-    if (score > best.score) {
-      best = { text, confidence, psm: pass.psm, label: pass.label, score };
-    }
-  }
-
-  return best;
 }
 
 /* ============================================================
@@ -1061,21 +796,12 @@ async function extractOCRFromRegion(pageNum, region) {
     crop.height
   );
 
-  const field = (region && region.type) ? region.type : "";
-  preprocessOcrCrop(crop, field);
-
   const worker = await getOcrWorker();
-
   const blob = await new Promise((res) => crop.toBlob(res, "image/png"));
-  if (!blob) return "";
+  const { data } = await worker.recognize(blob);
 
-  // Multi-pass OCR (vary PSM) then field-specific cleanup
-  return await runOcrExclusive(async () => {
-    const best = await ocrRecognizeMultiPass(worker, blob, field);
-    return cleanByField(field, best.text);
-  });
+  return (data.text || "").replace(/\s+/g, " ").trim();
 }
-
 
 /* ============================================================
    APPLY TEMPLATES TO ALL PAGES (Step 3)
@@ -1090,7 +816,7 @@ async function applyTemplatesToAllPages(logProgress = false) {
     if (!sheetDetailsByPage[pageNum]) sheetDetailsByPage[pageNum] = {};
 
     for (const field of REGION_TYPES) {
-      if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) continue;
+      if (sheetDetailsByPage[pageNum][field]) continue;
 
       const region = resolveRegionForPage(pageNum, field);
       if (!region) continue;
@@ -1105,7 +831,6 @@ async function applyTemplatesToAllPages(logProgress = false) {
       extracted = await extractOCRFromRegion(pageNum, region);
 }
 
-      extracted = cleanByField(field, extracted);
       sheetDetailsByPage[pageNum][field] = extracted || "";
     }
   }
@@ -1136,16 +861,12 @@ async function extractAll() {
     let extracted = await extractOCRFromRegion(currentPage, region);
     extracted = (extracted || "").trim();
 
-    if (extracted) {
-      documentDetails[field] = extracted;
-      if (field === "prepared_by" && preparedByInput) preparedByInput.value = extracted;
-      if (field === "project_id" && projectIdInput) projectIdInput.value = extracted;
-    } else {
-      // Don't overwrite a previously-good value with an empty/failed read
-      console.warn(`⚠️ Document field (${field}) read empty; keeping existing value`, documentDetails[field] || "<empty>");
-    }
+    documentDetails[field] = extracted;
 
-    console.log(`📄 Document field (${field}) →`, (documentDetails[field] || "").trim() || "<empty>");
+    if (field === "prepared_by" && preparedByInput) preparedByInput.value = extracted;
+    if (field === "project_id" && projectIdInput) projectIdInput.value = extracted;
+
+    console.log(`📄 Document field (${field}) →`, extracted || "<empty>");
   }
 
   // 2) Sheet fields on current page (promote to templates)
@@ -1157,16 +878,7 @@ async function extractAll() {
     extracted = (extracted || "").trim();
 
     if (!sheetDetailsByPage[currentPage]) sheetDetailsByPage[currentPage] = {};
-    const hadValue = Object.prototype.hasOwnProperty.call(sheetDetailsByPage[currentPage], field) && (sheetDetailsByPage[currentPage][field] || "").trim();
-    if (extracted) {
-      sheetDetailsByPage[currentPage][field] = extracted;
-    } else if (!hadValue) {
-      // Cache the empty result so we don't keep re-OCRing until geometry changes
-      sheetDetailsByPage[currentPage][field] = "";
-      console.warn(`⚠️ Sheet field (master) (${field}) read empty`);
-    } else {
-      console.warn(`⚠️ Sheet field (master) (${field}) read empty; keeping existing value`, sheetDetailsByPage[currentPage][field]);
-    }
+    sheetDetailsByPage[currentPage][field] = extracted;
 
     // promoteRegionToTemplate(region);
 
@@ -1178,7 +890,7 @@ async function extractAll() {
       promoteRegionToTemplate(region);
     }
 
-    console.log(`📄 Sheet field (master) (${field}) →`, (sheetDetailsByPage[currentPage]?.[field] || "").trim() || "<empty>");
+    console.log(`📄 Sheet field (master) (${field}) →`, extracted || "<empty>");
   }
 
   // 3) Apply templates to all pages (progress in console)
@@ -1215,15 +927,9 @@ window.addEventListener("keydown", (e) => {
       if (didCopy) {
         const regions = regionsByPage[currentPage] || [];
         const sel = new Set(selectedRegionIds);
-        const removedTypes = [...new Set(regions.filter((r) => sel.has(r.id)).map((r) => r.type).filter(Boolean))];
-
         regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
-        if (removedTypes.length) {
-          invalidatePageFields(currentPage, removedTypes);
-          if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-            syncTemplatesFromMaster(removedTypes);
-          }
-        }
+        const cutTypes = [...new Set(clipboardRegions.map((r) => r.type))].filter((t) => REGION_TYPES.includes(t));
+        invalidateSheetFields(currentPage, cutTypes);
         clearSelection();
         redrawRegions();
         console.log(`✂️ Cut ${clipboardRegions.length} region(s) from page ${currentPage}`);
@@ -1238,11 +944,7 @@ window.addEventListener("keydown", (e) => {
   // Paste
   if (modKey && (e.key === "v" || e.key === "V")) {
     if (clipboardRegions.length) {
-      if (e.shiftKey) {
-        pasteClipboardToCurrentPageAtPointer();
-      } else {
-        pasteClipboardToCurrentPage();
-      }
+      pasteClipboardToCurrentPage();
       e.preventDefault();
     }
     return;
@@ -1254,15 +956,10 @@ window.addEventListener("keydown", (e) => {
 
     const regions = regionsByPage[currentPage] || [];
     const sel = new Set(selectedRegionIds);
-    const removedTypes = [...new Set(regions.filter((r) => sel.has(r.id)).map((r) => r.type).filter(Boolean))];
-
+    const deletedTypes = [...new Set(regions.filter((r) => sel.has(r.id)).map((r) => r.type))].filter((t) => REGION_TYPES.includes(t));
     regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
-    if (removedTypes.length) {
-      invalidatePageFields(currentPage, removedTypes);
-      if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
-        syncTemplatesFromMaster(removedTypes);
-      }
-    }
+
+    invalidateSheetFields(currentPage, deletedTypes);
 
     clearSelection();
     redrawRegions();
