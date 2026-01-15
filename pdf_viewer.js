@@ -5,7 +5,7 @@
 // ============================================================
 
 // Vector extraction toggle (OCR-only when false)
-const ENABLE_VECTOR_EXTRACTION = false;
+const ENABLE_VECTOR_EXTRACTION = true;
 
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 
@@ -310,13 +310,6 @@ let isDraggingRegions = false;
 let dragStartPx = { x: 0, y: 0 };
 let dragHasMoved = false;
 
-if (dragHasMoved) {
-  const regs = regionsByPage[currentPage] || [];
-  const byId = new Map(regs.map(r => [r.id, r]));
-  const changedTypes = [...new Set(selectedRegionIds.map(id => byId.get(id)?.type).filter(Boolean))];
-  invalidatePageFields(currentPage, changedTypes);
-}
-
 let dragClickShouldToggleOff = false; // only for single-select re-click
 let dragStartById = new Map(); // id -> {x,y,w,h}
 
@@ -417,6 +410,26 @@ function onRegionDragEnd() {
   window.removeEventListener("mousemove", onRegionDragMove, true);
   window.removeEventListener("mouseup", onRegionDragEnd, true);
 
+  // If geometry changed, invalidate cached extraction results for the affected field types.
+  // This prevents "sticky" values when regions are moved.
+  if (dragHasMoved) {
+    const regs = regionsByPage[currentPage] || [];
+    const byId = new Map(regs.map((r) => [r.id, r]));
+    const changedTypes = [...new Set(
+      [...dragStartById.keys()].map((id) => byId.get(id)?.type).filter(Boolean)
+    )];
+
+    if (changedTypes.length) {
+      invalidatePageFields(currentPage, changedTypes);
+
+      // If we're editing the template master page, keep templates in sync and
+      // invalidate all pages so template-driven fields re-extract correctly.
+      if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+        syncTemplatesFromMaster(changedTypes);
+      }
+    }
+  }
+
   const shouldToggleOff = dragClickShouldToggleOff && !dragHasMoved;
 
   isDraggingRegions = false;
@@ -489,6 +502,12 @@ overlay?.addEventListener("mouseup", () => {
   regionsByPage[currentPage].push(region);
   
   invalidatePageFields(currentPage, [region.type]);
+
+  // If the user is drawing/editing regions on the template master page, keep
+  // the template geometry (and all derived page caches) consistent immediately.
+  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+    syncTemplatesFromMaster([region.type]);
+  }
 
 
   activeRect = null;
@@ -698,18 +717,56 @@ function pasteClipboardToCurrentPage() {
   syncLegacySelectedId();
   redrawRegions();
 
+  // If pasting on the template master page, update template geometry now.
+  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+    syncTemplatesFromMaster(changedTypes);
+  }
+
   console.log(`📋 Pasted ${newIds.length} region(s) onto page ${currentPage}`);
   return true;
 }
 
 
-// 1) Add this helper once (near your other helpers)
-  function invalidatePageFields(pageNum, types) {
-    if (!sheetDetailsByPage[pageNum]) return;
-    types.forEach(t => {
-      if (t in sheetDetailsByPage[pageNum]) delete sheetDetailsByPage[pageNum][t];
-    });
+// Cache invalidation: if a region's geometry changes, cached OCR/vector results
+// MUST be cleared or you'll see "sticky" values.
+function invalidatePageFields(pageNum, types) {
+  if (!sheetDetailsByPage[pageNum]) return;
+  types.forEach((t) => {
+    if (t in sheetDetailsByPage[pageNum]) delete sheetDetailsByPage[pageNum][t];
+  });
+}
+
+function invalidateAllPagesForTypes(types) {
+  const numPages = pdfDoc?.numPages || 0;
+  for (let p = 1; p <= numPages; p++) {
+    invalidatePageFields(p, types);
   }
+}
+
+function syncTemplatesFromMaster(types) {
+  if (TEMPLATE_MASTER_PAGE === null) return;
+  if (currentPage !== TEMPLATE_MASTER_PAGE) return;
+
+  types.forEach((type) => {
+    const latest = getMostRecentRegionOfType(TEMPLATE_MASTER_PAGE, type);
+
+    // If we still have a region of this type on the master, update template.
+    if (latest) {
+      promoteRegionToTemplate(latest);
+      return;
+    }
+
+    // If the last master region of this type was deleted, clear the template.
+    if (regionTemplates[type]) {
+      delete regionTemplates[type];
+      console.log(`📐 Template cleared for "${type}"`);
+    }
+  });
+
+  // Template changes affect *all* pages.
+  invalidateAllPagesForTypes(types);
+  redrawRegions();
+}
 
 
 
@@ -717,6 +774,9 @@ function pasteClipboardToCurrentPage() {
 function pasteClipboardToCurrentPageAtPointer() {
   if (!clipboardRegions.length || !clipboardBase) return false;
   if (!lastPointerNorm) return pasteClipboardToCurrentPage();
+
+  const changedTypes = [...new Set(clipboardRegions.map((r) => r.type))];
+  invalidatePageFields(currentPage, changedTypes);
 
   // Align the group's top-left (clipboardBase) to the current pointer
   let baseX = lastPointerNorm.x;
@@ -758,6 +818,11 @@ function pasteClipboardToCurrentPageAtPointer() {
   selectedRegionIds = newIds;
   syncLegacySelectedId();
   redrawRegions();
+
+  // If pasting on the template master page, update template geometry now.
+  if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+    syncTemplatesFromMaster(changedTypes);
+  }
 
   console.log(`📋 Pasted ${newIds.length} region(s) at pointer onto page ${currentPage}`);
   return true;
@@ -1150,7 +1215,15 @@ window.addEventListener("keydown", (e) => {
       if (didCopy) {
         const regions = regionsByPage[currentPage] || [];
         const sel = new Set(selectedRegionIds);
+        const removedTypes = [...new Set(regions.filter((r) => sel.has(r.id)).map((r) => r.type).filter(Boolean))];
+
         regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
+        if (removedTypes.length) {
+          invalidatePageFields(currentPage, removedTypes);
+          if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+            syncTemplatesFromMaster(removedTypes);
+          }
+        }
         clearSelection();
         redrawRegions();
         console.log(`✂️ Cut ${clipboardRegions.length} region(s) from page ${currentPage}`);
@@ -1181,7 +1254,15 @@ window.addEventListener("keydown", (e) => {
 
     const regions = regionsByPage[currentPage] || [];
     const sel = new Set(selectedRegionIds);
+    const removedTypes = [...new Set(regions.filter((r) => sel.has(r.id)).map((r) => r.type).filter(Boolean))];
+
     regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
+    if (removedTypes.length) {
+      invalidatePageFields(currentPage, removedTypes);
+      if (TEMPLATE_MASTER_PAGE !== null && currentPage === TEMPLATE_MASTER_PAGE) {
+        syncTemplatesFromMaster(removedTypes);
+      }
+    }
 
     clearSelection();
     redrawRegions();
