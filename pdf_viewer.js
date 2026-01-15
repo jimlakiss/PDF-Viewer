@@ -65,16 +65,56 @@ async function getOcrWorker() {
     throw new Error("Tesseract.createWorker not available");
   }
 
-  ocrWorkerPromise = (async () => {
-    const worker = await Tesseract.createWorker({
+  // Keep your explicit paths (but call createWorker with signatures that match the runtime)
+  const workerOptions = {
     workerPath: "https://unpkg.com/tesseract.js@5.0.4/dist/worker.min.js",
     corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
     langPath: "https://tessdata.projectnaptha.com/4.0.0"
-  });
+  };
 
-    await worker.loadLanguage("eng");
-    await worker.initialize("eng");
-    return worker;
+  ocrWorkerPromise = (async () => {
+    let worker = null;
+    const errors = [];
+
+    // Signature A (common in v5 builds): createWorker('eng', oem?, options?)
+    try {
+      // OEM 1 = LSTM only (most common). Some builds accept (lang, options) too, so we try both.
+      worker = await Tesseract.createWorker("eng", 1, workerOptions);
+      return worker;
+    } catch (e) {
+      errors.push(e);
+    }
+
+    try {
+      worker = await Tesseract.createWorker("eng", workerOptions);
+      return worker;
+    } catch (e) {
+      errors.push(e);
+    }
+
+    // Signature B (older style): createWorker(options) then loadLanguage/initialize
+    try {
+      worker = await Tesseract.createWorker(workerOptions);
+      await worker.loadLanguage("eng");
+      await worker.initialize("eng");
+      return worker;
+    } catch (e) {
+      errors.push(e);
+    }
+
+    // Signature C (fallback): createWorker() then loadLanguage/initialize
+    // (useful if the CDN build ignores/doesn't like custom paths)
+    try {
+      worker = await Tesseract.createWorker();
+      await worker.loadLanguage("eng");
+      await worker.initialize("eng");
+      return worker;
+    } catch (e) {
+      errors.push(e);
+    }
+
+    console.error("OCR worker init failed. Tried multiple createWorker signatures.", errors);
+    throw errors[errors.length - 1];
   })();
 
   return ocrWorkerPromise;
@@ -366,11 +406,13 @@ async function extractOCRFromRegion(pageNum, region) {
 
   const worker = await getOcrWorker();
 
-  // const { data } = await worker.recognize(crop);
-
   const blob = await new Promise(resolve =>
-  crop.toBlob(resolve, "image/png")
+    crop.toBlob(resolve, "image/png")
   );
+
+  if (!blob) {
+    throw new Error("OCR crop.toBlob() returned null (canvas empty or unsupported).");
+  }
 
   const { data } = await worker.recognize(blob);
 
