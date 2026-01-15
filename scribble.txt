@@ -1,0 +1,33 @@
+For the WHOLE PDF we need;
+
+const DOCUMENT_DETAILS = [
+  "prepared_by",
+  "project_id",
+];
+
+For EACH INDIVIDUAL SHEET we need;
+const REGION_TYPES = [
+  "sheet_id",
+  "description",
+  "issue_id",
+  "date",
+  "issue_description"
+];
+
+
+00 Cover
+01 Survey
+
+
+
+DOCUMENT_DETAILS = [
+  "prepared_by",
+  "project_id",
+];
+        REGION_TYPES = [
+                    "sheet_id",
+                    "description",
+                    "issue_id",
+                    "date",
+                    "issue_description"
+];

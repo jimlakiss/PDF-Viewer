@@ -61,7 +61,11 @@ const regionsByPage = {}; // { [pageNum]: [ {id,type,x,y,w,h} ] }
 
 const regionTemplates = {}; // { [fieldType]: {type,x,y,w,h} }
 
-let selectedRegionId = null;
+let selectedRegionIds = [];
+let selectedRegionId = null; // legacy mirror of selection (last selected)
+let clipboardRegions = [];
+let clipboardBase = null; // {minX, minY} of copied group
+let clipboardPasteSerial = 0;
 let regionIdCounter = 1;
 
 /* ============================================================
@@ -164,6 +168,7 @@ fileInput?.addEventListener("change", async (e) => {
   pdfDoc = null;
   currentPage = 1;
   scale = 1.5;
+  selectedRegionIds = [];
   selectedRegionId = null;
   regionIdCounter = 1;
 
@@ -205,6 +210,7 @@ async function renderPage(pageNum) {
   if (!pdfDoc) return;
 
   currentPage = pageNum;
+  selectedRegionIds = [];
   selectedRegionId = null;
 
   const page = await pdfDoc.getPage(pageNum);
@@ -287,6 +293,7 @@ overlay?.addEventListener("mousedown", (e) => {
   if (e.target?.tagName === "rect") return;
 
   isDrawing = true;
+  selectedRegionIds = [];
   selectedRegionId = null;
 
   const r = overlay.getBoundingClientRect();
@@ -357,11 +364,23 @@ function redrawRegions() {
     rect.dataset.id = String(r.id);
     rect.dataset.type = r.type;
 
-    if (r.id === selectedRegionId) rect.classList.add("selected");
+    if (selectedRegionIds.includes(r.id)) rect.classList.add("selected");
 
     rect.addEventListener("mousedown", (e) => {
       e.stopPropagation();
-      selectedRegionId = r.id;
+
+      if (e.shiftKey) {
+        // Shift+click toggles membership in the selection set
+        toggleSelection(r.id);
+      } else {
+        // Click selects single; clicking again de-selects (toggle off)
+        if (selectedRegionIds.length === 1 && selectedRegionIds[0] === r.id) {
+          clearSelection();
+        } else {
+          setSingleSelection(r.id);
+        }
+      }
+
       redrawRegions();
     });
 
@@ -394,6 +413,121 @@ function redrawRegions() {
    HELPERS
    ============================================================ */
 
+function syncLegacySelectedId() {
+  selectedRegionId =
+    selectedRegionIds.length > 0
+      ? selectedRegionIds[selectedRegionIds.length - 1]
+      : null;
+}
+
+function setSingleSelection(id) {
+  selectedRegionIds = [id];
+  syncLegacySelectedId();
+}
+
+function toggleSelection(id) {
+  const idx = selectedRegionIds.indexOf(id);
+  if (idx >= 0) {
+    selectedRegionIds.splice(idx, 1);
+  } else {
+    selectedRegionIds.push(id);
+  }
+  syncLegacySelectedId();
+}
+
+function clearSelection() {
+  selectedRegionIds = [];
+  selectedRegionId = null;
+}
+
+function isEditableTarget(el) {
+  if (!el) return false;
+  const tag = (el.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+}
+
+function clamp01(v) {
+  if (Number.isNaN(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
+function getSelectedRegionsOnCurrentPage() {
+  const regions = regionsByPage[currentPage] || [];
+  if (!selectedRegionIds.length) return [];
+  const sel = new Set(selectedRegionIds);
+  return regions.filter((r) => sel.has(r.id));
+}
+
+function copySelectionToClipboard() {
+  const regs = getSelectedRegionsOnCurrentPage();
+  if (!regs.length) return false;
+
+  const minX = Math.min(...regs.map((r) => r.x));
+  const minY = Math.min(...regs.map((r) => r.y));
+
+  clipboardBase = { minX, minY };
+  clipboardRegions = regs.map((r) => ({
+    type: r.type,
+    dx: r.x - minX,
+    dy: r.y - minY,
+    w: r.w,
+    h: r.h,
+  }));
+
+  clipboardPasteSerial = 0;
+  console.log(`📋 Copied ${clipboardRegions.length} region(s)`);
+  return true;
+}
+
+function pasteClipboardToCurrentPage() {
+  if (!clipboardRegions.length || !clipboardBase) return false;
+
+  // Nudge each paste so it’s visible
+  clipboardPasteSerial += 1;
+  const nudgePx = 10 * clipboardPasteSerial;
+  const nudgeX = canvas.width ? nudgePx / canvas.width : 0.01;
+  const nudgeY = canvas.height ? nudgePx / canvas.height : 0.01;
+
+  const baseX = clipboardBase.minX + nudgeX;
+  const baseY = clipboardBase.minY + nudgeY;
+
+  if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
+
+  const newIds = [];
+
+  clipboardRegions.forEach((it) => {
+    const id = regionIdCounter++;
+
+    let x = baseX + it.dx;
+    let y = baseY + it.dy;
+
+    // keep within page bounds
+    x = clamp01(x);
+    y = clamp01(y);
+    x = Math.min(x, 1 - it.w);
+    y = Math.min(y, 1 - it.h);
+
+    regionsByPage[currentPage].push({
+      id,
+      type: it.type,
+      x,
+      y,
+      w: it.w,
+      h: it.h,
+    });
+
+    newIds.push(id);
+  });
+
+  selectedRegionIds = newIds;
+  syncLegacySelectedId();
+  redrawRegions();
+
+  console.log(`📋 Pasted ${newIds.length} region(s) onto page ${currentPage}`);
+  return true;
+}
 function getMostRecentRegionOfType(pageNum, type) {
   const regions = regionsByPage[pageNum] || [];
   for (let i = regions.length - 1; i >= 0; i--) {
@@ -595,18 +729,66 @@ async function extractAll() {
 window.extractAll = extractAll;
 
 /* ============================================================
-   DELETE REGION
+   DELETE / COPY / PASTE (multi-select)
    ============================================================ */
 
 window.addEventListener("keydown", (e) => {
-  if ((e.key === "Delete" || e.key === "Backspace") && selectedRegionId) {
+  // Don’t hijack shortcuts while typing in inputs
+  if (isEditableTarget(document.activeElement)) return;
+
+  const modKey = e.ctrlKey || e.metaKey;
+
+  // Copy
+  if (modKey && (e.key === "c" || e.key === "C")) {
+    if (selectedRegionIds.length) {
+      copySelectionToClipboard();
+      e.preventDefault();
+    }
+    return;
+  }
+
+  // Cut
+  if (modKey && (e.key === "x" || e.key === "X")) {
+    if (selectedRegionIds.length) {
+      const didCopy = copySelectionToClipboard();
+      if (didCopy) {
+        const regions = regionsByPage[currentPage] || [];
+        const sel = new Set(selectedRegionIds);
+        regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
+        clearSelection();
+        redrawRegions();
+        console.log(`✂️ Cut ${clipboardRegions.length} region(s) from page ${currentPage}`);
+      }
+      e.preventDefault();
+    }
+    return;
+  }
+
+
+
+  // Paste
+  if (modKey && (e.key === "v" || e.key === "V")) {
+    if (clipboardRegions.length) {
+      pasteClipboardToCurrentPage();
+      e.preventDefault();
+    }
+    return;
+  }
+
+  // Delete selection
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (!selectedRegionIds.length) return;
+
     const regions = regionsByPage[currentPage] || [];
-    regionsByPage[currentPage] = regions.filter((r) => r.id !== selectedRegionId);
-    selectedRegionId = null;
+    const sel = new Set(selectedRegionIds);
+    regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
+
+    clearSelection();
     redrawRegions();
     e.preventDefault();
   }
 });
+
 
 /* ============================================================
    WHEEL: zoom + pan (zoom-to-cursor)
