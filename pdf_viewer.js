@@ -5,7 +5,7 @@
 // ============================================================
 
 // Vector extraction toggle (OCR-only when false)
-const ENABLE_VECTOR_EXTRACTION = false;
+const ENABLE_VECTOR_EXTRACTION = true;
 
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 
@@ -67,6 +67,9 @@ let clipboardRegions = [];
 let clipboardBase = null; // {minX, minY} of copied group
 let clipboardPasteSerial = 0;
 let regionIdCounter = 1;
+
+// Last mouse pointer position over the PDF canvas (normalized 0..1)
+let lastPointerNorm = null;
 
 /* ============================================================
    OCR WORKER (robust)
@@ -288,9 +291,136 @@ let startX = 0;
 let startY = 0;
 let activeRect = null;
 
+// --- Drag-move selected regions (Enhancement/1 Step 3)
+let isDraggingRegions = false;
+let dragStartPx = { x: 0, y: 0 };
+let dragHasMoved = false;
+
+if (dragHasMoved) {
+  const regs = regionsByPage[currentPage] || [];
+  const byId = new Map(regs.map(r => [r.id, r]));
+  const changedTypes = [...new Set(selectedRegionIds.map(id => byId.get(id)?.type).filter(Boolean))];
+  invalidatePageFields(currentPage, changedTypes);
+}
+
+let dragClickShouldToggleOff = false; // only for single-select re-click
+let dragStartById = new Map(); // id -> {x,y,w,h}
+
+function getOverlayPoint(evt) {
+  const r = overlay.getBoundingClientRect();
+  return { x: evt.clientX - r.left, y: evt.clientY - r.top };
+}
+
+// Track last pointer position over the overlay for "Shift+Paste at pointer"
+function updateLastPointerNormFromEvent(evt) {
+  if (!overlay) return;
+  const r = overlay.getBoundingClientRect();
+  const xPx = evt.clientX - r.left;
+  const yPx = evt.clientY - r.top;
+
+  // only update when pointer is over the overlay
+  if (xPx < 0 || yPx < 0 || xPx > r.width || yPx > r.height) return;
+
+  const x = r.width ? xPx / r.width : 0;
+  const y = r.height ? yPx / r.height : 0;
+
+  const cx = x < 0 ? 0 : x > 1 ? 1 : x;
+  const cy = y < 0 ? 0 : y > 1 ? 1 : y;
+  lastPointerNorm = { x: cx, y: cy };
+}
+
+// Passive global listener so Shift+Cmd/Ctrl+V works without extra clicks
+window.addEventListener("mousemove", updateLastPointerNormFromEvent, { passive: true });
+
+function beginRegionDrag(evt, clickShouldToggleOff) {
+  if (!overlay) return;
+
+  isDraggingRegions = true;
+  dragHasMoved = false;
+  dragClickShouldToggleOff = !!clickShouldToggleOff;
+  dragStartPx = getOverlayPoint(evt);
+
+  // Snapshot starting positions for all selected regions (normalized)
+  dragStartById = new Map();
+  const regs = regionsByPage[currentPage] || [];
+  const sel = new Set(selectedRegionIds);
+  regs.forEach((r) => {
+    if (sel.has(r.id)) {
+      dragStartById.set(r.id, { x: r.x, y: r.y, w: r.w, h: r.h });
+    }
+  });
+
+  // Track move/end even if pointer leaves the overlay
+  window.addEventListener("mousemove", onRegionDragMove, true);
+  window.addEventListener("mouseup", onRegionDragEnd, true);
+}
+
+function onRegionDragMove(evt) {
+  if (!isDraggingRegions) return;
+  if (!canvas.width || !canvas.height) return;
+
+  const p = getOverlayPoint(evt);
+  const dxPx = p.x - dragStartPx.x;
+  const dyPx = p.y - dragStartPx.y;
+
+  if (!dragHasMoved && (Math.abs(dxPx) > 2 || Math.abs(dyPx) > 2)) {
+    dragHasMoved = true;
+  }
+
+  let dx = dxPx / canvas.width;
+  let dy = dyPx / canvas.height;
+
+  // Clamp as a GROUP so relative spacing is preserved.
+  let minDx = -Infinity, maxDx = Infinity;
+  let minDy = -Infinity, maxDy = Infinity;
+
+  dragStartById.forEach(({ x, y, w, h }) => {
+    minDx = Math.max(minDx, -x);
+    maxDx = Math.min(maxDx, (1 - w) - x);
+    minDy = Math.max(minDy, -y);
+    maxDy = Math.min(maxDy, (1 - h) - y);
+  });
+
+  dx = Math.min(Math.max(dx, minDx), maxDx);
+  dy = Math.min(Math.max(dy, minDy), maxDy);
+
+  const regs = regionsByPage[currentPage] || [];
+  const byId = new Map(regs.map(r => [r.id, r]));
+
+  dragStartById.forEach((s, id) => {
+    const r = byId.get(id);
+    if (!r) return;
+    r.x = s.x + dx;
+    r.y = s.y + dy;
+  });
+
+  redrawRegions();
+}
+
+function onRegionDragEnd() {
+  if (!isDraggingRegions) return;
+
+  window.removeEventListener("mousemove", onRegionDragMove, true);
+  window.removeEventListener("mouseup", onRegionDragEnd, true);
+
+  const shouldToggleOff = dragClickShouldToggleOff && !dragHasMoved;
+
+  isDraggingRegions = false;
+  dragClickShouldToggleOff = false;
+  dragStartById = new Map();
+
+  if (shouldToggleOff) {
+    clearSelection();
+  }
+
+  redrawRegions();
+}
+
+
 overlay?.addEventListener("mousedown", (e) => {
-  // Click on an existing region selects it (handled by rect listener)
+  // Click on an existing region selects/drag-moves it (handled by rect listener)
   if (e.target?.tagName === "rect") return;
+  if (isDraggingRegions) return;
 
   isDrawing = true;
   selectedRegionIds = [];
@@ -305,6 +435,7 @@ overlay?.addEventListener("mousedown", (e) => {
 });
 
 overlay?.addEventListener("mousemove", (e) => {
+  if (isDraggingRegions) return; // drag handled on window
   if (!isDrawing || !activeRect) return;
 
   const r = overlay.getBoundingClientRect();
@@ -318,6 +449,7 @@ overlay?.addEventListener("mousemove", (e) => {
 });
 
 overlay?.addEventListener("mouseup", () => {
+  if (isDraggingRegions) return; // drag handled on window
   if (!isDrawing || !activeRect) return;
   isDrawing = false;
 
@@ -341,6 +473,9 @@ overlay?.addEventListener("mouseup", () => {
 
   if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
   regionsByPage[currentPage].push(region);
+  
+  invalidatePageFields(currentPage, [region.type]);
+
 
   activeRect = null;
   redrawRegions();
@@ -369,18 +504,39 @@ function redrawRegions() {
     rect.addEventListener("mousedown", (e) => {
       e.stopPropagation();
 
+      // Multi-select toggle (no drag)
       if (e.shiftKey) {
-        // Shift+click toggles membership in the selection set
         toggleSelection(r.id);
-      } else {
-        // Click selects single; clicking again de-selects (toggle off)
-        if (selectedRegionIds.length === 1 && selectedRegionIds[0] === r.id) {
-          clearSelection();
-        } else {
-          setSingleSelection(r.id);
-        }
+        redrawRegions();
+        return;
       }
 
+      // Record click intent BEFORE any selection changes
+      const preWasSelected = selectedRegionIds.includes(r.id);
+      const preWasSingleSame = (selectedRegionIds.length === 1 && selectedRegionIds[0] === r.id);
+      const preWasMulti = selectedRegionIds.length > 1;
+
+      // Click behaviour:
+      // - if clicking an UNSELECTED region, switch to single-select (and drag that)
+      // - if clicking a SELECTED region, preserve selection so multi-select can drag as a group
+      if (!preWasSelected) {
+        setSingleSelection(r.id);
+        redrawRegions();
+        beginRegionDrag(e, false);
+        return;
+      }
+
+      if (preWasMulti) {
+        // Keep the multi-selection intact; dragging any selected member moves the group.
+        beginRegionDrag(e, false);
+        redrawRegions();
+        return;
+      }
+
+      // preWasSingleSame: click again should toggle OFF unless user drags
+      // We defer the toggle-off to mouseup if there was no drag movement.
+      // Start drag tracking either way.
+      beginRegionDrag(e, preWasSingleSame);
       redrawRegions();
     });
 
@@ -484,6 +640,9 @@ function copySelectionToClipboard() {
 function pasteClipboardToCurrentPage() {
   if (!clipboardRegions.length || !clipboardBase) return false;
 
+  const changedTypes = [...new Set(clipboardRegions.map(r => r.type))];
+  invalidatePageFields(currentPage, changedTypes);
+
   // Nudge each paste so it’s visible
   clipboardPasteSerial += 1;
   const nudgePx = 10 * clipboardPasteSerial;
@@ -526,6 +685,67 @@ function pasteClipboardToCurrentPage() {
   redrawRegions();
 
   console.log(`📋 Pasted ${newIds.length} region(s) onto page ${currentPage}`);
+  return true;
+}
+
+
+// 1) Add this helper once (near your other helpers)
+  function invalidatePageFields(pageNum, types) {
+    if (!sheetDetailsByPage[pageNum]) return;
+    types.forEach(t => {
+      if (t in sheetDetailsByPage[pageNum]) delete sheetDetailsByPage[pageNum][t];
+    });
+  }
+
+
+
+
+function pasteClipboardToCurrentPageAtPointer() {
+  if (!clipboardRegions.length || !clipboardBase) return false;
+  if (!lastPointerNorm) return pasteClipboardToCurrentPage();
+
+  // Align the group's top-left (clipboardBase) to the current pointer
+  let baseX = lastPointerNorm.x;
+  let baseY = lastPointerNorm.y;
+
+  // Clamp as a GROUP so the whole pasted set stays on-page
+  let groupMaxX = 0;
+  let groupMaxY = 0;
+  clipboardRegions.forEach((it) => {
+    groupMaxX = Math.max(groupMaxX, it.dx + it.w);
+    groupMaxY = Math.max(groupMaxY, it.dy + it.h);
+  });
+
+  baseX = Math.min(Math.max(baseX, 0), Math.max(0, 1 - groupMaxX));
+  baseY = Math.min(Math.max(baseY, 0), Math.max(0, 1 - groupMaxY));
+
+  if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
+
+  const newIds = [];
+
+  clipboardRegions.forEach((it) => {
+    const id = regionIdCounter++;
+
+    const x = baseX + it.dx;
+    const y = baseY + it.dy;
+
+    regionsByPage[currentPage].push({
+      id,
+      type: it.type,
+      x,
+      y,
+      w: it.w,
+      h: it.h,
+    });
+
+    newIds.push(id);
+  });
+
+  selectedRegionIds = newIds;
+  syncLegacySelectedId();
+  redrawRegions();
+
+  console.log(`📋 Pasted ${newIds.length} region(s) at pointer onto page ${currentPage}`);
   return true;
 }
 function getMostRecentRegionOfType(pageNum, type) {
@@ -625,6 +845,43 @@ async function extractOCRFromRegion(pageNum, region) {
 
   const worker = await getOcrWorker();
   const blob = await new Promise((res) => crop.toBlob(res, "image/png"));
+  
+  
+  // Tune Tesseract per field (PSM, DPI, spacing, whitelist)
+  
+    async function setOcrProfile(worker, fieldType) {
+    const common = {
+      user_defined_dpi: "300",
+      preserve_interword_spaces: "1",
+    };
+
+    // Page Segmentation Mode: try 6 or 7 most often
+    // (6 = block of text, 7 = single line).  [oai_citation:1‡muthu.co](https://muthu.co/all-tesseract-ocr-options/?utm_source=chatgpt.com)
+    if (fieldType === "sheet_id" || fieldType === "issue_id") {
+      await worker.setParameters({
+        ...common,
+        tessedit_pageseg_mode: "7",
+        tessedit_char_whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_.",
+      });
+      return;
+    }
+
+    if (fieldType === "date") {
+      await worker.setParameters({
+        ...common,
+        tessedit_pageseg_mode: "7",
+        tessedit_char_whitelist: "0123456789/.-",
+      });
+      return;
+    }
+
+    // General text (description, issue_description, prepared_by, project_id)
+    await worker.setParameters({
+      ...common,
+      tessedit_pageseg_mode: "6",
+    });
+  }
+
   const { data } = await worker.recognize(blob);
 
   return (data.text || "").replace(/\s+/g, " ").trim();
@@ -769,7 +1026,11 @@ window.addEventListener("keydown", (e) => {
   // Paste
   if (modKey && (e.key === "v" || e.key === "V")) {
     if (clipboardRegions.length) {
-      pasteClipboardToCurrentPage();
+      if (e.shiftKey) {
+        pasteClipboardToCurrentPageAtPointer();
+      } else {
+        pasteClipboardToCurrentPage();
+      }
       e.preventDefault();
     }
     return;
