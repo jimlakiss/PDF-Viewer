@@ -56,8 +56,9 @@ body {
 /* Small toolbar layout helpers */
 .field-group {
   display: inline-flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-direction: row;      /* ✅ Prepared By + Project ID on one line */
+  align-items: center;
+  gap: 16px;
   margin-right: 10px;
 }
 
@@ -147,44 +148,28 @@ canvas {
 .swatch[data-swatch="issue_description"] { background: #5ac8fa; }
 
 /* Region colours by type */
-rect[data-type="prepared_by"] {
-  stroke: #007aff;
-  fill: #007aff;
-}
+rect[data-type="prepared_by"] { stroke: #007aff; fill: #007aff; }
+rect[data-type="project_id"]  { stroke: #2dd4bf; fill: #2dd4bf; }
+rect[data-type="sheet_id"]    { stroke: #8b5cf6; fill: #8b5cf6; }
+rect[data-type="description"] { stroke: #34c759; fill: #34c759; }
+rect[data-type="issue_id"]    { stroke: #ff9500; fill: #ff9500; }
+rect[data-type="date"]        { stroke: #ec4899; fill: #ec4899; }
+rect[data-type="issue_description"] { stroke: #5ac8fa; fill: #5ac8fa; }
 
-rect[data-type="project_id"] {
-  stroke: #2dd4bf;
-  fill: #2dd4bf;
-}
-
-rect[data-type="sheet_id"] {
-  stroke: #8b5cf6;
-  fill: #8b5cf6;
-}
-
-rect[data-type="description"] {
-  stroke: #34c759;
-  fill: #34c759;
-}
-
-rect[data-type="issue_id"] {
-  stroke: #ff9500;
-  fill: #ff9500;
-}
-
-rect[data-type="date"] {
-  stroke: #ec4899;
-  fill: #ec4899;
-}
-
-rect[data-type="issue_description"] {
-  stroke: #5ac8fa;
-  fill: #5ac8fa;
-}
-
-/* Selected override (keep your existing behaviour) */
+/* Selected override */
 #overlay rect.selected {
   stroke: #ff3b30 !important;
   fill: #ff3b30 !important;
   stroke-width: 3;
+}
+
+/* ---------- Toolbar alignment helpers ---------- */
+.toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.toolbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }

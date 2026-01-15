@@ -1,17 +1,20 @@
 // pdf_viewer.js
-// Field-colour strategy + per-field Extract buttons (minimal changes)
+// Multi-page PDF viewer + region drawing + vector/OCR extraction + templates + JSON/CSV export
+// ============================================================
+// EXTRACTION MODES
+// ============================================================
 
-const DOCUMENT_DETAILS = [
-  "prepared_by",
-  "project_id",
-];
+// Vector extraction toggle (OCR-only when false)
+const ENABLE_VECTOR_EXTRACTION = false;
+
+const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 
 const REGION_TYPES = [
   "sheet_id",
   "description",
   "issue_id",
   "date",
-  "issue_description"
+  "issue_description",
 ];
 
 const fileInput = document.getElementById("file-input");
@@ -28,6 +31,8 @@ const pdfScroll = document.getElementById("pdf-scroll");
 const overlay = document.getElementById("overlay");
 
 const regionTypeSelect = document.getElementById("region-type");
+const drawTypeSwatch = document.getElementById("draw-type-swatch");
+
 const preparedByInput = document.getElementById("prepared-by");
 const projectIdInput = document.getElementById("project-id");
 
@@ -35,32 +40,32 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 /* ============================================================
-   REGION TEMPLATES (Feature 1 — Step 1)
-   ============================================================ */
-
-// One template per sheet-level field (geometry only, normalised)
-const regionTemplates = {};
-
-/* ============================================================
    STATE
    ============================================================ */
+
+let TEMPLATE_MASTER_PAGE = null;
 
 let pdfDoc = null;
 let currentPage = 1;
 let scale = 1.5;
 
+let pdfFileBaseName = "pdf_extracted_data";
+
 const documentDetails = {
   prepared_by: "",
-  project_id: ""
+  project_id: "",
 };
 
-const sheetDetailsByPage = {};
-const regionsByPage = {};
+const sheetDetailsByPage = {}; // { [pageNum]: { field: value } }
+const regionsByPage = {}; // { [pageNum]: [ {id,type,x,y,w,h} ] }
+
+const regionTemplates = {}; // { [fieldType]: {type,x,y,w,h} }
+
 let selectedRegionId = null;
 let regionIdCounter = 1;
 
 /* ============================================================
-   OCR WORKER (ROBUST, SINGLE INSTANCE)
+   OCR WORKER (robust)
    ============================================================ */
 
 let ocrWorkerPromise = null;
@@ -69,60 +74,51 @@ async function getOcrWorker() {
   if (ocrWorkerPromise) return ocrWorkerPromise;
 
   if (!window.Tesseract?.createWorker) {
-    throw new Error("Tesseract.createWorker not available");
+    throw new Error(
+      "Tesseract.createWorker not available (is tesseract.js loaded?)"
+    );
   }
 
   const workerOptions = {
     workerPath: "https://unpkg.com/tesseract.js@5.0.4/dist/worker.min.js",
-    corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
-    langPath: "https://tessdata.projectnaptha.com/4.0.0"
+    corePath:
+      "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
+    langPath: "https://tessdata.projectnaptha.com/4.0.0",
   };
 
   ocrWorkerPromise = (async () => {
-    let worker = null;
-    const errors = [];
+    let worker;
 
+    // Try v5 signature first (eng, numWorkers, options)
     try {
       worker = await Tesseract.createWorker("eng", 1, workerOptions);
       return worker;
-    } catch (e) { errors.push(e); }
+    } catch (_) {
+      // Fall back to classic signature (options) then load/init
+    }
 
-    try {
-      worker = await Tesseract.createWorker("eng", workerOptions);
-      return worker;
-    } catch (e) { errors.push(e); }
-
-    try {
-      worker = await Tesseract.createWorker(workerOptions);
-      await worker.loadLanguage("eng");
-      await worker.initialize("eng");
-      return worker;
-    } catch (e) { errors.push(e); }
-
-    try {
-      worker = await Tesseract.createWorker();
-      await worker.loadLanguage("eng");
-      await worker.initialize("eng");
-      return worker;
-    } catch (e) { errors.push(e); }
-
-    console.error("OCR worker init failed", errors);
-    throw errors[errors.length - 1];
+    worker = await Tesseract.createWorker(workerOptions);
+    await worker.loadLanguage("eng");
+    await worker.initialize("eng");
+    return worker;
   })();
 
   return ocrWorkerPromise;
 }
 
 /* ============================================================
-   INIT (populate draw-type dropdown)
+   INIT UI
    ============================================================ */
 
 (function initRegionTypeSelect() {
+  if (!regionTypeSelect) return;
+
   regionTypeSelect.innerHTML = "";
 
   const ogDoc = document.createElement("optgroup");
   ogDoc.label = "DOCUMENT_DETAILS";
-  DOCUMENT_DETAILS.forEach(type => {
+
+  DOCUMENT_DETAILS.forEach((type) => {
     const opt = document.createElement("option");
     opt.value = type;
     opt.textContent = type;
@@ -131,7 +127,8 @@ async function getOcrWorker() {
 
   const ogSheet = document.createElement("optgroup");
   ogSheet.label = "REGION_TYPES";
-  REGION_TYPES.forEach(type => {
+
+  REGION_TYPES.forEach((type) => {
     const opt = document.createElement("option");
     opt.value = type;
     opt.textContent = type;
@@ -140,36 +137,64 @@ async function getOcrWorker() {
 
   regionTypeSelect.appendChild(ogDoc);
   regionTypeSelect.appendChild(ogSheet);
+
+  // Keep the draw-type colour swatch in sync with the current selection
+  function syncDrawTypeSwatch() {
+    if (!drawTypeSwatch) return;
+    drawTypeSwatch.setAttribute("data-swatch", regionTypeSelect.value);
+  }
+  regionTypeSelect.addEventListener("change", syncDrawTypeSwatch);
+  syncDrawTypeSwatch();
 })();
 
 /* ============================================================
    LOAD PDF
    ============================================================ */
 
-fileInput.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
+fileInput?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
   if (!file) return;
+
+  // Base name for exports: PDF filename (without extension)
+  pdfFileBaseName =
+    (file.name || "pdf_extracted_data").replace(/\.[^.]+$/, "") ||
+    "pdf_extracted_data";
+
+  // Reset state for new PDF
+  pdfDoc = null;
+  currentPage = 1;
+  scale = 1.5;
+  selectedRegionId = null;
+  regionIdCounter = 1;
+
+  for (const k of Object.keys(documentDetails)) documentDetails[k] = "";
+  for (const k of Object.keys(sheetDetailsByPage)) delete sheetDetailsByPage[k];
+  for (const k of Object.keys(regionsByPage)) delete regionsByPage[k];
+  for (const k of Object.keys(regionTemplates)) delete regionTemplates[k];
+
+  if (preparedByInput) preparedByInput.value = "";
+  if (projectIdInput) projectIdInput.value = "";
 
   const reader = new FileReader();
   reader.onload = async () => {
     const data = new Uint8Array(reader.result);
     pdfDoc = await pdfjsLib.getDocument(data).promise;
     await buildThumbnails();
-    renderPage(1);
+    await renderPage(1);
   };
   reader.readAsArrayBuffer(file);
 });
 
 /* ============================================================
-   DOCUMENT DETAILS (manual override)
+   MANUAL OVERRIDES (document fields)
    ============================================================ */
 
-preparedByInput.addEventListener("input", () => {
-  documentDetails.prepared_by = preparedByInput.value;
+preparedByInput?.addEventListener("input", () => {
+  documentDetails.prepared_by = preparedByInput.value || "";
 });
 
-projectIdInput.addEventListener("input", () => {
-  documentDetails.project_id = projectIdInput.value;
+projectIdInput?.addEventListener("input", () => {
+  documentDetails.project_id = projectIdInput.value || "";
 });
 
 /* ============================================================
@@ -177,6 +202,8 @@ projectIdInput.addEventListener("input", () => {
    ============================================================ */
 
 async function renderPage(pageNum) {
+  if (!pdfDoc) return;
+
   currentPage = pageNum;
   selectedRegionId = null;
 
@@ -191,31 +218,37 @@ async function renderPage(pageNum) {
 
   await page.render({ canvasContext: ctx, viewport }).promise;
 
-  pageIndicator.textContent = `Page ${currentPage} / ${pdfDoc.numPages}`;
+  if (pageIndicator) {
+    pageIndicator.textContent = `Page ${currentPage} / ${pdfDoc.numPages}`;
+  }
+
   highlightActiveThumb();
   redrawRegions();
 }
 
 /* ============================================================
-   ZOOM
+   ZOOM BUTTONS
    ============================================================ */
 
-zoomInBtn.onclick = () => {
+zoomInBtn?.addEventListener("click", () => {
   scale *= 1.1;
   renderPage(currentPage);
-};
+});
 
-zoomOutBtn.onclick = () => {
+zoomOutBtn?.addEventListener("click", () => {
   scale /= 1.1;
   renderPage(currentPage);
-};
+});
 
 /* ============================================================
    THUMBNAILS
    ============================================================ */
 
 async function buildThumbnails() {
+  if (!pdfDoc || !sidebar) return;
+
   sidebar.innerHTML = "";
+
   for (let i = 1; i <= pdfDoc.numPages; i++) {
     const page = await pdfDoc.getPage(i);
     const viewport = page.getViewport({ scale: 0.2 });
@@ -226,9 +259,12 @@ async function buildThumbnails() {
     c.classList.add("thumb");
 
     await page.render({ canvasContext: c.getContext("2d"), viewport }).promise;
-    c.onclick = () => renderPage(i);
+
+    c.addEventListener("click", () => renderPage(i));
     sidebar.appendChild(c);
   }
+
+  highlightActiveThumb();
 }
 
 function highlightActiveThumb() {
@@ -246,8 +282,9 @@ let startX = 0;
 let startY = 0;
 let activeRect = null;
 
-overlay.addEventListener("mousedown", (e) => {
-  if (e.target.tagName === "rect") return;
+overlay?.addEventListener("mousedown", (e) => {
+  // Click on an existing region selects it (handled by rect listener)
+  if (e.target?.tagName === "rect") return;
 
   isDrawing = true;
   selectedRegionId = null;
@@ -260,7 +297,7 @@ overlay.addEventListener("mousedown", (e) => {
   overlay.appendChild(activeRect);
 });
 
-overlay.addEventListener("mousemove", (e) => {
+overlay?.addEventListener("mousemove", (e) => {
   if (!isDrawing || !activeRect) return;
 
   const r = overlay.getBoundingClientRect();
@@ -273,7 +310,7 @@ overlay.addEventListener("mousemove", (e) => {
   activeRect.setAttribute("height", Math.abs(y - startY));
 });
 
-overlay.addEventListener("mouseup", () => {
+overlay?.addEventListener("mouseup", () => {
   if (!isDrawing || !activeRect) return;
   isDrawing = false;
 
@@ -288,7 +325,7 @@ overlay.addEventListener("mouseup", () => {
 
   const region = {
     id: regionIdCounter++,
-    type: regionTypeSelect.value,
+    type: regionTypeSelect?.value || REGION_TYPES[0],
     x: +activeRect.getAttribute("x") / canvas.width,
     y: +activeRect.getAttribute("y") / canvas.height,
     w: w / canvas.width,
@@ -303,18 +340,21 @@ overlay.addEventListener("mouseup", () => {
 });
 
 function redrawRegions() {
+  if (!overlay) return;
+
   overlay.innerHTML = "";
 
-  const regions = regionsByPage[currentPage];
-  if (!regions) return;
+  const pageRegions = regionsByPage[currentPage] || [];
 
-  regions.forEach(r => {
+  // 1) Draw real (page-specific) regions
+  pageRegions.forEach((r) => {
     const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     rect.setAttribute("x", r.x * canvas.width);
     rect.setAttribute("y", r.y * canvas.height);
     rect.setAttribute("width", r.w * canvas.width);
     rect.setAttribute("height", r.h * canvas.height);
-    rect.dataset.id = r.id;
+
+    rect.dataset.id = String(r.id);
     rect.dataset.type = r.type;
 
     if (r.id === selectedRegionId) rect.classList.add("selected");
@@ -327,10 +367,31 @@ function redrawRegions() {
 
     overlay.appendChild(rect);
   });
+
+  // 2) Draw ghost template regions (only where no override exists on this page)
+  Object.values(regionTemplates).forEach((tpl) => {
+    const hasOverrideOnThisPage = pageRegions.some((r) => r.type === tpl.type);
+    if (hasOverrideOnThisPage) return;
+
+    const ghost = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    ghost.setAttribute("x", tpl.x * canvas.width);
+    ghost.setAttribute("y", tpl.y * canvas.height);
+    ghost.setAttribute("width", tpl.w * canvas.width);
+    ghost.setAttribute("height", tpl.h * canvas.height);
+
+    ghost.dataset.type = tpl.type;     // 👈 inherit field colour
+    ghost.setAttribute("fill", "none");
+    ghost.setAttribute("stroke-width", "1");
+    ghost.setAttribute("stroke-dasharray", "6 4");
+    ghost.setAttribute("opacity", "0.45");
+    ghost.style.pointerEvents = "none";
+
+    overlay.appendChild(ghost);
+  });
 }
 
 /* ============================================================
-   VECTOR EXTRACTION + FEATURE 1 HELPERS
+   HELPERS
    ============================================================ */
 
 function getMostRecentRegionOfType(pageNum, type) {
@@ -341,26 +402,14 @@ function getMostRecentRegionOfType(pageNum, type) {
   return null;
 }
 
-/* ============================================================
-   FEATURE 1 HELPERS (templates + overrides)
-   ============================================================ */
-
-// Resolve region geometry for a page:
-//   1) page-specific override (most recent)
-//   2) template
-//   3) null
 function resolveRegionForPage(pageNum, type) {
   const pageRegions = regionsByPage[pageNum] || [];
-  const override = [...pageRegions].reverse().find(r => r.type === type);
+  const override = [...pageRegions].reverse().find((r) => r.type === type);
   if (override) return override;
-
   if (regionTemplates[type]) return regionTemplates[type];
-
   return null;
 }
 
-// Promote region geometry to a template (geometry only, normalised).
-// Note: this does not affect any existing page-specific overrides.
 function promoteRegionToTemplate(region) {
   if (!region || !region.type) return;
 
@@ -375,19 +424,23 @@ function promoteRegionToTemplate(region) {
   console.log(`📐 Template set for "${region.type}"`, regionTemplates[region.type]);
 }
 
+/* ============================================================
+   VECTOR EXTRACTION (kept, but OCR is used in Extract All)
+   ============================================================ */
+
 async function extractVectorTextFromRegion(pageNum, region) {
   const page = await pdfDoc.getPage(pageNum);
-  const textContent = await page.getTextContent();
   const viewport = page.getViewport({ scale });
+  const textContent = await page.getTextContent();
 
-  const xMin = region.x * canvas.width;
-  const yMin = region.y * canvas.height;
-  const xMax = xMin + region.w * canvas.width;
-  const yMax = yMin + region.h * canvas.height;
+  const xMin = region.x * viewport.width;
+  const yMin = region.y * viewport.height;
+  const xMax = xMin + region.w * viewport.width;
+  const yMax = yMin + region.h * viewport.height;
 
   const strings = [];
 
-  textContent.items.forEach(item => {
+  textContent.items.forEach((item) => {
     const [, , , , tx, ty] = pdfjsLib.Util.transform(
       viewport.transform,
       item.transform
@@ -402,7 +455,7 @@ async function extractVectorTextFromRegion(pageNum, region) {
 }
 
 /* ============================================================
-   OCR FALLBACK (ACTUALLY FIRES)
+   OCR EXTRACTION
    ============================================================ */
 
 async function extractOCRFromRegion(pageNum, region) {
@@ -417,88 +470,129 @@ async function extractOCRFromRegion(pageNum, region) {
 
   await page.render({
     canvasContext: offCanvas.getContext("2d"),
-    viewport
+    viewport,
   }).promise;
 
-  const x = region.x * offCanvas.width;
-  const y = region.y * offCanvas.height;
-  const w = region.w * offCanvas.width;
-  const h = region.h * offCanvas.height;
-
   const crop = document.createElement("canvas");
-  crop.width = w;
-  crop.height = h;
+  crop.width = Math.max(1, Math.round(region.w * offCanvas.width));
+  crop.height = Math.max(1, Math.round(region.h * offCanvas.height));
 
-  crop.getContext("2d").drawImage(offCanvas, x, y, w, h, 0, 0, w, h);
-
-  const worker = await getOcrWorker();
-
-  const blob = await new Promise(resolve =>
-    crop.toBlob(resolve, "image/png")
+  crop.getContext("2d").drawImage(
+    offCanvas,
+    region.x * offCanvas.width,
+    region.y * offCanvas.height,
+    crop.width,
+    crop.height,
+    0,
+    0,
+    crop.width,
+    crop.height
   );
 
-  if (!blob) throw new Error("OCR crop.toBlob() returned null");
-
+  const worker = await getOcrWorker();
+  const blob = await new Promise((res) => crop.toBlob(res, "image/png"));
   const { data } = await worker.recognize(blob);
 
   return (data.text || "").replace(/\s+/g, " ").trim();
 }
 
 /* ============================================================
-   PER-FIELD EXTRACT BUTTONS
+   APPLY TEMPLATES TO ALL PAGES (Step 3)
    ============================================================ */
 
-document.querySelectorAll("[data-extract-doc]").forEach(btn => {
-  btn.addEventListener("click", async () => {
-    const field = btn.dataset.extractDoc;
+async function applyTemplatesToAllPages(logProgress = false) {
+  if (!pdfDoc) return;
+
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    if (logProgress)
+      console.log(`📐 Extracting page ${pageNum} / ${pdfDoc.numPages}`);
+    if (!sheetDetailsByPage[pageNum]) sheetDetailsByPage[pageNum] = {};
+
+    for (const field of REGION_TYPES) {
+      if (sheetDetailsByPage[pageNum][field]) continue;
+
+      const region = resolveRegionForPage(pageNum, field);
+      if (!region) continue;
+
+      let extracted = "";
+
+      if (ENABLE_VECTOR_EXTRACTION) {
+      extracted = await extractVectorTextFromRegion(pageNum, region);
+      }
+
+      if (!extracted) {
+      extracted = await extractOCRFromRegion(pageNum, region);
+}
+
+      sheetDetailsByPage[pageNum][field] = extracted || "";
+    }
+  }
+
+  console.log("✅ Templates applied to all pages");
+}
+
+window.applyTemplatesToAllPages = applyTemplatesToAllPages;
+
+/* ============================================================
+   EXTRACT ALL (single button)
+   - OCR-first (vector is still used as fallback in applyTemplates)
+   ============================================================ */
+
+async function extractAll() {
+  if (!pdfDoc) return alert("No PDF loaded");
+
+  console.log(`🚀 Extract started (${pdfDoc.numPages} pages)`);
+
+  // 1) Document fields (once, from current page)
+  for (const field of DOCUMENT_DETAILS) {
     const region = getMostRecentRegionOfType(currentPage, field);
-
     if (!region) {
-      alert(`No region drawn for ${field}`);
-      return;
+      console.warn(`⚠️ No region drawn for document field: ${field}`);
+      continue;
     }
 
-    let extracted = await extractVectorTextFromRegion(currentPage, region);
-    let source = "vector";
-
-    if (!extracted) {
-      extracted = await extractOCRFromRegion(currentPage, region);
-      source = extracted ? "ocr" : "none";
-    }
+    let extracted = await extractOCRFromRegion(currentPage, region);
+    extracted = (extracted || "").trim();
 
     documentDetails[field] = extracted;
 
-    if (field === "prepared_by") preparedByInput.value = extracted;
-    if (field === "project_id") projectIdInput.value = extracted;
+    if (field === "prepared_by" && preparedByInput) preparedByInput.value = extracted;
+    if (field === "project_id" && projectIdInput) projectIdInput.value = extracted;
 
-    console.log(`📄 Document extraction (${source}): ${field}`, extracted || "<empty>");
-  });
-});
+    console.log(`📄 Document field (${field}) →`, extracted || "<empty>");
+  }
 
-document.querySelectorAll("[data-extract-sheet]").forEach(btn => {
-  btn.addEventListener("click", async () => {
-    const field = btn.dataset.extractSheet;
+  // 2) Sheet fields on current page (promote to templates)
+  for (const field of REGION_TYPES) {
     const region = getMostRecentRegionOfType(currentPage, field);
+    if (!region) continue;
 
-    if (!region) {
-      alert(`No region drawn for ${field}`);
-      return;
-    }
-
-    let extracted = await extractVectorTextFromRegion(currentPage, region);
-    let source = "vector";
-
-    if (!extracted) {
-      extracted = await extractOCRFromRegion(currentPage, region);
-      source = extracted ? "ocr" : "none";
-    }
+    let extracted = await extractOCRFromRegion(currentPage, region);
+    extracted = (extracted || "").trim();
 
     if (!sheetDetailsByPage[currentPage]) sheetDetailsByPage[currentPage] = {};
     sheetDetailsByPage[currentPage][field] = extracted;
 
-    console.log(`📄 Sheet extraction (${source}): page ${currentPage} / ${field}`, extracted || "<empty>");
-  });
-});
+    // promoteRegionToTemplate(region);
+
+    if (TEMPLATE_MASTER_PAGE === null) {
+      TEMPLATE_MASTER_PAGE = currentPage;
+    }
+
+    if (currentPage === TEMPLATE_MASTER_PAGE) {
+      promoteRegionToTemplate(region);
+    }
+
+    console.log(`📄 Sheet field (master) (${field}) →`, extracted || "<empty>");
+  }
+
+  // 3) Apply templates to all pages (progress in console)
+  await applyTemplatesToAllPages(true);
+
+  console.log("✅ Extract All complete");
+}
+
+window.extractAll = extractAll;
 
 /* ============================================================
    DELETE REGION
@@ -506,10 +600,8 @@ document.querySelectorAll("[data-extract-sheet]").forEach(btn => {
 
 window.addEventListener("keydown", (e) => {
   if ((e.key === "Delete" || e.key === "Backspace") && selectedRegionId) {
-    const regions = regionsByPage[currentPage];
-    if (!regions) return;
-
-    regionsByPage[currentPage] = regions.filter(r => r.id !== selectedRegionId);
+    const regions = regionsByPage[currentPage] || [];
+    regionsByPage[currentPage] = regions.filter((r) => r.id !== selectedRegionId);
     selectedRegionId = null;
     redrawRegions();
     e.preventDefault();
@@ -517,69 +609,147 @@ window.addEventListener("keydown", (e) => {
 });
 
 /* ============================================================
-   WHEEL
+   WHEEL: zoom + pan (zoom-to-cursor)
    ============================================================ */
 
-pdfScroll.addEventListener("wheel", (e) => {
-  e.preventDefault();
-  if (e.shiftKey) return;
+pdfScroll?.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
 
-  const PAN = 3;
-  const ZOOM = 1.1;
+    // Disable shift behaviour (reserved / buggy)
+    if (e.shiftKey) return;
 
-  if (e.ctrlKey) {
-    pdfScroll.scrollLeft += e.deltaY * PAN;
-    return;
-  }
+    const PAN_SPEED = 3;
+    const ZOOM_FACTOR = 1.1;
 
-  if (e.altKey) {
-    pdfScroll.scrollTop += e.deltaY * PAN;
-    return;
-  }
+    // Ctrl + wheel → horizontal pan
+    if (e.ctrlKey) {
+      pdfScroll.scrollLeft += e.deltaY * PAN_SPEED;
+      return;
+    }
 
-  const rect = pdfScroll.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+    // Alt + wheel → vertical pan
+    if (e.altKey) {
+      pdfScroll.scrollTop += e.deltaY * PAN_SPEED;
+      return;
+    }
 
-  const px = (pdfScroll.scrollLeft + mx) / scale;
-  const py = (pdfScroll.scrollTop + my) / scale;
+    // Normal wheel → zoom to cursor
+    const rect = pdfScroll.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
 
-  scale *= e.deltaY < 0 ? ZOOM : 1 / ZOOM;
-  scale = Math.min(Math.max(scale, 0.3), 5);
+    const px = (pdfScroll.scrollLeft + mx) / scale;
+    const py = (pdfScroll.scrollTop + my) / scale;
 
-  renderPage(currentPage);
+    scale *= e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+    scale = Math.min(Math.max(scale, 0.3), 5);
 
-  requestAnimationFrame(() => {
-    pdfScroll.scrollLeft = px * scale - mx;
-    pdfScroll.scrollTop = py * scale - my;
-  });
-}, { passive: false });
+    renderPage(currentPage);
+
+    requestAnimationFrame(() => {
+      pdfScroll.scrollLeft = px * scale - mx;
+      pdfScroll.scrollTop = py * scale - my;
+    });
+  },
+  { passive: false }
+);
 
 /* ============================================================
-   EXPORT JSON
+   EXPORT: canonical shape (document + sheets[])
    ============================================================ */
 
-function getExtractedDataAsJSON() {
-  const result = { document: {}, sheets: {} };
+function getCanonicalExportData() {
+  const doc = {
+    prepared_by: (documentDetails.prepared_by || "").trim(),
+    project_id: (documentDetails.project_id || "").trim(),
+  };
 
-  DOCUMENT_DETAILS.forEach(field => {
-    const v = (documentDetails[field] || "").trim();
-    result.document[field] = v || { error: "No value could be extracted" };
-  });
+  const sheets = [];
+  const numPages = pdfDoc?.numPages || 0;
 
-  Object.keys(sheetDetailsByPage).forEach(p => {
-    result.sheets[p] = {};
-    REGION_TYPES.forEach(f => {
-      const v = (sheetDetailsByPage[p]?.[f] || "").trim();
-      result.sheets[p][f] = v || { error: "No value could be extracted" };
+  for (let p = 1; p <= numPages; p++) {
+    const s = sheetDetailsByPage[p] || {};
+    sheets.push({
+      page: p,
+      sheet_id: (s.sheet_id || "").trim(),
+      description: (s.description || "").trim(),
+      issue_id: (s.issue_id || "").trim(),
+      date: (s.date || "").trim(),
+      issue_description: (s.issue_description || "").trim(),
     });
-  });
+  }
 
-  return result;
+  return { document: doc, sheets };
 }
 
-window.exportExtractedData = function () {
-  const data = getExtractedDataAsJSON();
+window.exportExtractedData = async function () {
+  if (typeof applyTemplatesToAllPages === "function") {
+    await applyTemplatesToAllPages(true);
+  }
+  const data = getCanonicalExportData();
   console.log(JSON.stringify(data, null, 2));
   return data;
+};
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+window.downloadJSON = async function () {
+  if (typeof applyTemplatesToAllPages === "function") {
+    await applyTemplatesToAllPages(true);
+  }
+  const data = getCanonicalExportData();
+  const json = JSON.stringify(data, null, 2);
+  downloadBlob(new Blob([json], { type: "application/json" }), `${pdfFileBaseName}.json`);
+  console.log("⬇️ JSON exported", `${pdfFileBaseName}.json`);
+};
+
+window.downloadCSV = async function () {
+  if (typeof applyTemplatesToAllPages === "function") {
+    await applyTemplatesToAllPages(true);
+  }
+
+  const { document, sheets } = getCanonicalExportData();
+
+  const headers = [
+    "prepared_by",
+    "project_id",
+    "page",
+    "sheet_id",
+    "description",
+    "issue_id",
+    "date",
+    "issue_description",
+  ];
+
+  const rows = sheets.map((s) => [
+    document.prepared_by,
+    document.project_id,
+    s.page,
+    s.sheet_id,
+    s.description,
+    s.issue_id,
+    s.date,
+    s.issue_description,
+  ]);
+
+  const csv = [
+    headers.join(","),
+    ...rows.map((r) =>
+      r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")
+    ),
+  ].join("\n");
+
+  downloadBlob(new Blob([csv], { type: "text/csv" }), `${pdfFileBaseName}.csv`);
+  console.log("⬇️ CSV exported", `${pdfFileBaseName}.csv`);
 };
