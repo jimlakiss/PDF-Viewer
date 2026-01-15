@@ -2,8 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>PDF Viewer – Sidebar & Zoom</title>
-
+  <title>PDF Viewer</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -11,10 +10,55 @@
   <div id="sidebar"></div>
 
   <div id="main">
-    <div id="toolbar">
+    <div id="toolbar" onmousedown="event.stopPropagation()">
       <input type="file" id="file-input" accept="application/pdf" />
-      <button id="zoom-out">−</button>
-      <button id="zoom-in">+</button>
+
+      <!-- DOCUMENT_DETAILS -->
+      <div class="field-group">
+        <div class="field-row" data-field-row="prepared_by">
+          <span class="swatch" data-swatch="prepared_by"></span>
+          <label for="prepared-by">Prepared by</label>
+          <input id="prepared-by" placeholder="Prepared by" />
+          <button type="button" data-extract-doc="prepared_by">Extract</button>
+        </div>
+
+        <div class="field-row" data-field-row="project_id">
+          <span class="swatch" data-swatch="project_id"></span>
+          <label for="project-id">Project ID</label>
+          <input id="project-id" placeholder="Project ID" />
+          <button type="button" data-extract-doc="project_id">Extract</button>
+        </div>
+      </div>
+
+      <!-- REGION TYPES DRAWING SELECTOR (unchanged concept, expanded options) -->
+      <div class="field-row compact">
+        <label for="region-type">Draw type</label>
+        <select id="region-type"></select>
+      </div>
+
+      <!-- REGION_TYPES extraction buttons (per current page for now) -->
+      <div class="field-group">
+        <div class="field-row compact">
+          <span class="swatch" data-swatch="sheet_id"></span>
+          <button type="button" data-extract-sheet="sheet_id">Extract sheet_id</button>
+
+          <span class="swatch" data-swatch="description"></span>
+          <button type="button" data-extract-sheet="description">Extract description</button>
+
+          <span class="swatch" data-swatch="issue_id"></span>
+          <button type="button" data-extract-sheet="issue_id">Extract issue_id</button>
+
+          <span class="swatch" data-swatch="date"></span>
+          <button type="button" data-extract-sheet="date">Extract date</button>
+
+          <span class="swatch" data-swatch="issue_description"></span>
+          <button type="button" data-extract-sheet="issue_description">Extract issue_description</button>
+        </div>
+      </div>
+
+      <button id="zoom-out" type="button">−</button>
+      <button id="zoom-in" type="button">+</button>
+
       <span id="page-indicator">Page – / –</span>
     </div>
 
@@ -27,8 +71,9 @@
       </div>
     </div>
   </div>
-
+  
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://unpkg.com/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
   <script src="pdf_viewer.js"></script>
 </body>
 </html>

@@ -48,8 +48,39 @@ body {
   padding: 8px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   border-bottom: 1px solid #ccc;
+  flex-wrap: wrap;
+}
+
+/* Small toolbar layout helpers */
+.field-group {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-right: 10px;
+}
+
+.field-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-row.compact label {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.field-row input {
+  width: 180px;
+}
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  display: inline-block;
 }
 
 /* ---------- Viewer ---------- */
@@ -57,17 +88,17 @@ body {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;      /* IMPORTANT: viewer never scrolls */
+  overflow: hidden;
   background: #bdbdbd;
 }
 
-/* ---------- PDF Scroll Surface ---------- */
+/* ---------- PDF Scroll ---------- */
 #pdf-scroll {
   width: 100%;
   height: 100%;
-  overflow: auto;        /* ONLY scroll container */
+  overflow: auto;
   display: flex;
-  justify-content: flex-start;   /* (keep your current locked setting) */
+  justify-content: flex-start;
   align-items: flex-start;
 }
 
@@ -87,17 +118,73 @@ canvas {
 #overlay {
   position: absolute;
   inset: 0;
-  pointer-events: all;   /* ✅ CHANGED: allows drawing */
+  pointer-events: all;
 }
 
+/* ---------- Region Styles ---------- */
 #overlay rect {
-  fill: rgba(0, 120, 255, 0.15);
-  stroke: #0078ff;
   stroke-width: 2;
+  fill-opacity: 0.15;
 }
 
+/* ============================================================
+   Colour strategy (important but simple)
+   - Document fields:
+     prepared_by = blue, project_id = teal
+   - Sheet fields:
+     sheet_id = purple, description = green, issue_id = orange,
+     date = pink, issue_description = cyan
+   ============================================================ */
+
+/* Swatches */
+.swatch[data-swatch="prepared_by"] { background: #007aff; }
+.swatch[data-swatch="project_id"]  { background: #2dd4bf; }
+
+.swatch[data-swatch="sheet_id"]          { background: #8b5cf6; }
+.swatch[data-swatch="description"]       { background: #34c759; }
+.swatch[data-swatch="issue_id"]          { background: #ff9500; }
+.swatch[data-swatch="date"]              { background: #ec4899; }
+.swatch[data-swatch="issue_description"] { background: #5ac8fa; }
+
+/* Region colours by type */
+rect[data-type="prepared_by"] {
+  stroke: #007aff;
+  fill: #007aff;
+}
+
+rect[data-type="project_id"] {
+  stroke: #2dd4bf;
+  fill: #2dd4bf;
+}
+
+rect[data-type="sheet_id"] {
+  stroke: #8b5cf6;
+  fill: #8b5cf6;
+}
+
+rect[data-type="description"] {
+  stroke: #34c759;
+  fill: #34c759;
+}
+
+rect[data-type="issue_id"] {
+  stroke: #ff9500;
+  fill: #ff9500;
+}
+
+rect[data-type="date"] {
+  stroke: #ec4899;
+  fill: #ec4899;
+}
+
+rect[data-type="issue_description"] {
+  stroke: #5ac8fa;
+  fill: #5ac8fa;
+}
+
+/* Selected override (keep your existing behaviour) */
 #overlay rect.selected {
-  stroke: #ff3b30;
+  stroke: #ff3b30 !important;
+  fill: #ff3b30 !important;
   stroke-width: 3;
-  fill: rgba(255, 59, 48, 0.15);
 }
