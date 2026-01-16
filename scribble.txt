@@ -1,33 +1,17 @@
-For the WHOLE PDF we need;
 
-const DOCUMENT_DETAILS = [
-  "prepared_by",
-  "project_id",
-];
+To Do
+Oh, and UNDO. All functions, command/control + Z. for everything, all shapes, restoring deleted
 
-For EACH INDIVIDUAL SHEET we need;
-const REGION_TYPES = [
-  "sheet_id",
-  "description",
-  "issue_id",
-  "date",
-  "issue_description"
-];
+Why not just have an actual SVG paste to the identical place on the proceeding sheets after the main? 
+Leave them the sane colour as now to know they are the 'slave', just make them movableetc.
+Still leave the ability to draw new shapes at this stage.
 
 
-00 Cover
-01 Survey
+Done
+Is it possible to Paste on mouse pointer? Or am I stretching the friendship?
 
 
-
-DOCUMENT_DETAILS = [
-  "prepared_by",
-  "project_id",
-];
-        REGION_TYPES = [
-                    "sheet_id",
-                    "description",
-                    "issue_id",
-                    "date",
-                    "issue_description"
-];
+There is some funng stuff happening with the pasted SVG's not picking up the data correctly. Can you have a look? 
+Some appear to be storing the data from the first drawn area. 
+Not sure if it's me not double clicking and making them their colour and leaving the page when they're red?
+Maybe worth having a failsafe script with the Extract button, 'make all coloured and not red/selected"?
