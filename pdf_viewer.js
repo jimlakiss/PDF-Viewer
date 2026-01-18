@@ -1,4 +1,4 @@
-// pdf_viewer.js - COMPLETE LATEST VERSION v38
+// pdf_viewer.js - COMPLETE LATEST VERSION
 // Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
 const ENABLE_VECTOR_EXTRACTION = true;
@@ -61,6 +61,8 @@ let dragStartById = new Map();
 let currentRenderTask = null;
 const thumbnailDataCache = new Map();
 
+// ghostExclusions variable
+const ghostExclusions = {}; // { pageNum: Set(['sheet_id', ...]) }
 // Undo/Redo system
 const undoStack = [];
 const redoStack = [];
@@ -837,8 +839,14 @@ regionsByPage[currentPage] = pageRegions.filter(r => !r.isGhost || selectedSet.h
   // Get fresh list after filtering ghosts
   const currentPageRegions = regionsByPage[currentPage] || [];
   
-// Add ghost regions from templates (if they don't have page-specific overrides)
-Object.values(regionTemplates).forEach((tpl) => {
+  // Add ghost regions from templates (if they don't have page-specific overrides)
+  Object.values(regionTemplates).forEach((tpl) => {
+  // Check if this ghost is excluded on this page
+  if (ghostExclusions[currentPage] && ghostExclusions[currentPage].has(tpl.type)) {
+    console.log(`🚫 Page ${currentPage}: Ghost "${tpl.type}" is excluded`);
+    return;
+  }
+  
   // Check if we already have this ghost in selection
   const existingGhost = currentPageRegions.find(r => r.isGhost && r.type === tpl.type);
   if (existingGhost) {
@@ -1086,6 +1094,13 @@ function resolveRegionForPage(pageNum, type) {
   const pageRegions = regionsByPage[pageNum] || [];
   const override = [...pageRegions].reverse().find((r) => r.type === type);
   if (override) return override;
+  
+  // Check if this ghost is excluded on this page
+  if (ghostExclusions[pageNum] && ghostExclusions[pageNum].has(type)) {
+    console.log(`⏭️ Page ${pageNum}: Skipping extraction for excluded ghost "${type}"`);
+    return null; // Don't extract if ghost was deleted
+  }
+  
   if (regionTemplates[type]) return regionTemplates[type];
   return null;
 }
@@ -1608,20 +1623,46 @@ window.addEventListener("keydown", (e) => {
 
   // DELETE: Delete or Backspace key
   if (e.key === "Delete" || e.key === "Backspace") {
-    if (!selectedRegionIds.length) return;
+  if (!selectedRegionIds.length) return;
 
-    const regions = regionsByPage[currentPage] || [];
-    const sel = new Set(selectedRegionIds);
-    const deletedTypes = [...new Set(regions.filter(r => sel.has(r.id)).map(r => r.type))];
-    regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
-    invalidatePageFields(currentPage, deletedTypes);
-    
-    saveUndoState(); // ADDED
-    
-    clearSelection();
-    redrawRegions();
-    e.preventDefault();
-  }
+  saveUndoState();
+
+  const regions = regionsByPage[currentPage] || [];
+  const sel = new Set(selectedRegionIds);
+  const selectedRegions = regions.filter(r => sel.has(r.id));
+  
+  selectedRegions.forEach(region => {
+    if (region.isGhost) {
+      // RULE 2: Delete ghost on this page only - add to exclusion list
+      console.log(`🗑️ Hiding ghost "${region.type}" on page ${currentPage}`);
+      
+      if (!ghostExclusions[currentPage]) {
+        ghostExclusions[currentPage] = new Set();
+      }
+      ghostExclusions[currentPage].add(region.type);
+      
+      regionsByPage[currentPage] = regionsByPage[currentPage].filter(r => r.id !== region.id);
+      invalidatePageFields(currentPage, [region.type]);
+      
+    } else {
+      // RULE 1: Delete main shape from templates (removes from all pages)
+      console.log(`🗑️ Deleting main shape "${region.type}" from ALL pages`);
+      
+      if (regionTemplates[region.type]) {
+        delete regionTemplates[region.type];
+      }
+      
+      Object.keys(regionsByPage).forEach(pageNum => {
+        regionsByPage[pageNum] = regionsByPage[pageNum].filter(r => r.type !== region.type);
+        invalidatePageFields(parseInt(pageNum), [region.type]);
+      });
+    }
+  });
+  
+  clearSelection();
+  redrawRegions();
+  e.preventDefault();
+}
 });
 
 pdfScroll?.addEventListener("wheel", (e) => {
