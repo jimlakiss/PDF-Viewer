@@ -727,7 +727,14 @@ function onRegionDragMove(evt) {
     if (!r) return;
     r.x = s.x + dx;
     r.y = s.y + dy;
+    
+    // If dragging a ghost, convert it to a real region immediately
+    if (r.isGhost) {
+      delete r.isGhost;
+      console.log(`👻→✓ Converting ghost "${r.type}" to real region (dragging)`);
+    }
   });
+
   redrawRegions();
 }
 
@@ -823,29 +830,42 @@ function redrawRegions() {
   
   // Clear previous ghost regions from current page before redrawing
   const pageRegions = regionsByPage[currentPage] || [];
-  regionsByPage[currentPage] = pageRegions.filter(r => !r.isGhost);
+  // Don't clear ghosts that are currently selected (being dragged)
+const selectedSet = new Set(selectedRegionIds);
+regionsByPage[currentPage] = pageRegions.filter(r => !r.isGhost || selectedSet.has(r.id));
   
   // Get fresh list after filtering ghosts
   const currentPageRegions = regionsByPage[currentPage] || [];
   
-  // Add ghost regions from templates (if they don't have page-specific overrides)
-  Object.values(regionTemplates).forEach((tpl) => {
-    const hasOverride = currentPageRegions.some((r) => r.type === tpl.type && !r.isGhost);
-    if (hasOverride) return;
+// Add ghost regions from templates (if they don't have page-specific overrides)
+Object.values(regionTemplates).forEach((tpl) => {
+  // Check if we already have this ghost in selection
+  const existingGhost = currentPageRegions.find(r => r.isGhost && r.type === tpl.type);
+  if (existingGhost) {
+    console.log(`♻️ Keeping existing ghost "${tpl.type}" (ID: ${existingGhost.id})`);
+    return; // Keep the existing one, don't create a new one
+  }
+  
+  const hasOverride = currentPageRegions.some((r) => r.type === tpl.type && !r.isGhost);
+  if (hasOverride) {
+    console.log(`⏭️ Page ${currentPage}: Skipping ghost for "${tpl.type}" (has real region)`);
+    return;
+  }
 
-    // Create editable ghost region from template
-    const ghostRegion = {
-      id: regionIdCounter++,
-      type: tpl.type,
-      x: tpl.x,
-      y: tpl.y,
-      w: tpl.w,
-      h: tpl.h,
-      isGhost: true,
-    };
+  // Create editable ghost region from template
+  const ghostRegion = {
+    id: regionIdCounter++,
+    type: tpl.type,
+    x: tpl.x,
+    y: tpl.y,
+    w: tpl.w,
+    h: tpl.h,
+    isGhost: true,
+  };
 
-    currentPageRegions.push(ghostRegion);
-  });
+  console.log(`👻 Page ${currentPage}: Adding ghost for "${tpl.type}"`);
+  currentPageRegions.push(ghostRegion);
+});
   
   // Draw all regions (real + ghosts)
   currentPageRegions.forEach((r) => {
