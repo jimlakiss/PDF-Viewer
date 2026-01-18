@@ -1,165 +1,222 @@
-// pdf_viewer.js - IMPROVED OCR VERSION
-// Multi-page PDF viewer + region drawing + vector/OCR extraction + templates + JSON/CSV export
-// ============================================================
-// EXTRACTION MODES
-// ============================================================
+// pdf_viewer.js - COMPLETE LATEST VERSION v38
+// Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
-// Vector extraction toggle (OCR-only when false)
 const ENABLE_VECTOR_EXTRACTION = true;
-
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
-
-const REGION_TYPES = [
-  "sheet_id",
-  "description",
-  "issue_id",
-  "date",
-  "issue_description",
-];
+const REGION_TYPES = ["sheet_id", "description", "issue_id", "date", "issue_description"];
 
 const fileInput = document.getElementById("file-input");
 const canvas = document.getElementById("pdf-canvas");
 const ctx = canvas.getContext("2d");
-
 const sidebar = document.getElementById("sidebar");
 const pageIndicator = document.getElementById("page-indicator");
-
 const zoomInBtn = document.getElementById("zoom-in");
 const zoomOutBtn = document.getElementById("zoom-out");
-
 const pdfScroll = document.getElementById("pdf-scroll");
 const overlay = document.getElementById("overlay");
-
 const regionTypeSelect = document.getElementById("region-type");
 const drawTypeSwatch = document.getElementById("draw-type-swatch");
-
 const preparedByInput = document.getElementById("prepared-by");
 const projectIdInput = document.getElementById("project-id");
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-
-/* ============================================================
-   STATE
-   ============================================================ */
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+if (pdfjsLib.GlobalWorkerOptions) {
+  pdfjsLib.GlobalWorkerOptions.enableXfa = false;
+}
 
 let TEMPLATE_MASTER_PAGE = null;
-
 let pdfDoc = null;
 let currentPage = 1;
 let scale = 1.5;
-
 let pdfFileBaseName = "pdf_extracted_data";
+let multiPdfDocs = [];
+let isMultiPdfMode = false;
 
-const documentDetails = {
-  prepared_by: "",
-  project_id: "",
-};
-
-const sheetDetailsByPage = {}; // { [pageNum]: { field: value } }
-const regionsByPage = {}; // { [pageNum]: [ {id,type,x,y,w,h} ] }
-
-const regionTemplates = {}; // { [fieldType]: {type,x,y,w,h} }
+const documentDetails = { prepared_by: "", project_id: "" };
+const sheetDetailsByPage = {};
+const regionsByPage = {};
+const regionTemplates = {};
 
 let selectedRegionIds = [];
-let selectedRegionId = null; // legacy mirror of selection (last selected)
+let selectedRegionId = null;
 let clipboardRegions = [];
-let clipboardBase = null; // {minX, minY} of copied group
+let clipboardBase = null;
 let clipboardPasteSerial = 0;
 let regionIdCounter = 1;
-
-// Last mouse pointer position over the PDF canvas (normalized 0..1)
 let lastPointerNorm = null;
 
-/* ============================================================
-   OCR WORKER (robust)
-   ============================================================ */
-
 let ocrWorkerPromise = null;
+let _ocrJobChain = Promise.resolve();
+
+let isDrawing = false;
+let startX = 0;
+let startY = 0;
+let activeRect = null;
+
+let isDraggingRegions = false;
+let dragStartPx = { x: 0, y: 0 };
+let dragHasMoved = false;
+let dragClickShouldToggleOff = false;
+let dragStartById = new Map();
+let currentRenderTask = null;
+const thumbnailDataCache = new Map();
+
+// Undo/Redo system
+const undoStack = [];
+const redoStack = [];
+const MAX_UNDO_STACK = 50;
+
+function saveUndoState() {
+  // Save current state
+  const state = {
+    regionsByPage: JSON.parse(JSON.stringify(regionsByPage)),
+    sheetDetailsByPage: JSON.parse(JSON.stringify(sheetDetailsByPage)),
+    regionTemplates: JSON.parse(JSON.stringify(regionTemplates)),
+    selectedRegionIds: [...selectedRegionIds],
+    currentPage: currentPage,
+  };
+  
+  undoStack.push(state);
+  
+  // Limit stack size
+  if (undoStack.length > MAX_UNDO_STACK) {
+    undoStack.shift();
+  }
+  
+  // Clear redo stack when new action is performed
+  redoStack.length = 0;
+  
+  console.log(`💾 Undo state saved (stack: ${undoStack.length})`);
+}
+
+function undo() {
+  if (undoStack.length === 0) {
+    console.log('❌ Nothing to undo');
+    return;
+  }
+  
+  // Save current state to redo stack
+  const currentState = {
+    regionsByPage: JSON.parse(JSON.stringify(regionsByPage)),
+    sheetDetailsByPage: JSON.parse(JSON.stringify(sheetDetailsByPage)),
+    regionTemplates: JSON.parse(JSON.stringify(regionTemplates)),
+    selectedRegionIds: [...selectedRegionIds],
+    currentPage: currentPage,
+  };
+  redoStack.push(currentState);
+  
+  // Restore previous state
+  const prevState = undoStack.pop();
+  
+  Object.keys(regionsByPage).forEach(k => delete regionsByPage[k]);
+  Object.assign(regionsByPage, prevState.regionsByPage);
+  
+  Object.keys(sheetDetailsByPage).forEach(k => delete sheetDetailsByPage[k]);
+  Object.assign(sheetDetailsByPage, prevState.sheetDetailsByPage);
+  
+  Object.keys(regionTemplates).forEach(k => delete regionTemplates[k]);
+  Object.assign(regionTemplates, prevState.regionTemplates);
+  
+  selectedRegionIds.length = 0;
+  selectedRegionIds.push(...prevState.selectedRegionIds);
+  syncLegacySelectedId();
+  
+  currentPage = prevState.currentPage;
+  
+  console.log(`↶ Undo applied (undo: ${undoStack.length}, redo: ${redoStack.length})`);
+  
+  renderPage(currentPage);
+}
+
+function redo() {
+  if (redoStack.length === 0) {
+    console.log('❌ Nothing to redo');
+    return;
+  }
+  
+  // Save current state to undo stack
+  const currentState = {
+    regionsByPage: JSON.parse(JSON.stringify(regionsByPage)),
+    sheetDetailsByPage: JSON.parse(JSON.stringify(sheetDetailsByPage)),
+    regionTemplates: JSON.parse(JSON.stringify(regionTemplates)),
+    selectedRegionIds: [...selectedRegionIds],
+    currentPage: currentPage,
+  };
+  undoStack.push(currentState);
+  
+  // Restore next state
+  const nextState = redoStack.pop();
+  
+  Object.keys(regionsByPage).forEach(k => delete regionsByPage[k]);
+  Object.assign(regionsByPage, nextState.regionsByPage);
+  
+  Object.keys(sheetDetailsByPage).forEach(k => delete sheetDetailsByPage[k]);
+  Object.assign(sheetDetailsByPage, nextState.sheetDetailsByPage);
+  
+  Object.keys(regionTemplates).forEach(k => delete regionTemplates[k]);
+  Object.assign(regionTemplates, nextState.regionTemplates);
+  
+  selectedRegionIds.length = 0;
+  selectedRegionIds.push(...nextState.selectedRegionIds);
+  syncLegacySelectedId();
+  
+  currentPage = nextState.currentPage;
+  
+  console.log(`↷ Redo applied (undo: ${undoStack.length}, redo: ${redoStack.length})`);
+  
+  renderPage(currentPage);
+}
 
 async function getOcrWorker() {
   if (ocrWorkerPromise) return ocrWorkerPromise;
-
   if (!window.Tesseract?.createWorker) {
-    throw new Error(
-      "Tesseract.createWorker not available (is tesseract.js loaded?)"
-    );
+    throw new Error("Tesseract.createWorker not available");
   }
-
   const workerOptions = {
     workerPath: "https://unpkg.com/tesseract.js@5.0.4/dist/worker.min.js",
-    corePath:
-      "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
+    corePath: "https://unpkg.com/tesseract.js-core@5.0.0/tesseract-core-simd.wasm.js",
     langPath: "https://tessdata.projectnaptha.com/4.0.0",
   };
-
   ocrWorkerPromise = (async () => {
     let worker;
-
-    // Try v5 signature first (eng, numWorkers, options)
     try {
       worker = await Tesseract.createWorker("eng", 1, workerOptions);
       return worker;
-    } catch (_) {
-      // Fall back to classic signature (options) then load/init
-    }
-
+    } catch (_) {}
     worker = await Tesseract.createWorker(workerOptions);
     await worker.loadLanguage("eng");
     await worker.initialize("eng");
     return worker;
   })();
-
   return ocrWorkerPromise;
 }
 
-
-/* ============================================================
-   OCR JOB QUEUE (prevents concurrent setParameters/recognize races)
-   ============================================================ */
-
-let _ocrJobChain = Promise.resolve();
-
 function runOcrExclusive(fn) {
-  // Ensures only one OCR job runs at a time on the shared worker.
   _ocrJobChain = _ocrJobChain.then(fn, fn);
   return _ocrJobChain;
 }
 
-
-/* ============================================================
-   INIT UI
-   ============================================================ */
-
 (function initRegionTypeSelect() {
   if (!regionTypeSelect) return;
-
   regionTypeSelect.innerHTML = "";
-
   const ogDoc = document.createElement("optgroup");
   ogDoc.label = "DOCUMENT_DETAILS";
-
   DOCUMENT_DETAILS.forEach((type) => {
     const opt = document.createElement("option");
     opt.value = type;
     opt.textContent = type;
     ogDoc.appendChild(opt);
   });
-
   const ogSheet = document.createElement("optgroup");
   ogSheet.label = "REGION_TYPES";
-
   REGION_TYPES.forEach((type) => {
     const opt = document.createElement("option");
     opt.value = type;
     opt.textContent = type;
     ogSheet.appendChild(opt);
   });
-
   regionTypeSelect.appendChild(ogDoc);
   regionTypeSelect.appendChild(ogSheet);
-
-  // Keep the draw-type colour swatch in sync with the current selection
   function syncDrawTypeSwatch() {
     if (!drawTypeSwatch) return;
     drawTypeSwatch.setAttribute("data-swatch", regionTypeSelect.value);
@@ -168,21 +225,42 @@ function runOcrExclusive(fn) {
   syncDrawTypeSwatch();
 })();
 
-/* ============================================================
-   LOAD PDF
-   ============================================================ */
-
 fileInput?.addEventListener("change", async (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
+  const files = Array.from(e.target.files || []);
+  
+  console.log(`🔍 FILE INPUT CHANGE DETECTED:`);
+  console.log(`   - e.target.files:`, e.target.files);
+  console.log(`   - files array length:`, files.length);
+  console.log(`   - files array:`, files.map(f => f.name));
+  
+  if (!files.length) {
+    console.log('❌ No files selected');
+    return;
+  }
 
-  // Base name for exports: PDF filename (without extension)
-  pdfFileBaseName =
-    (file.name || "pdf_extracted_data").replace(/\.[^.]+$/, "") ||
-    "pdf_extracted_data";
+  if (files.length > 1) {
+    console.log(`📚 MULTI-FILE MODE: Loading ${files.length} PDF files...`);
+    await loadMultiplePDFs(files);
+    return;
+  }
 
-  // Reset state for new PDF
+  console.log('📂 SINGLE-FILE MODE');
+  const file = files[0];
+  const fileSizeMB = file.size / (1024 * 1024);
+  
+  if (fileSizeMB > 20) {
+    console.warn(`⚠️ Large file detected (${fileSizeMB.toFixed(1)} MB)`);
+    if (!confirm(`This is a large file (${fileSizeMB.toFixed(1)} MB). Continue?`)) {
+      fileInput.value = '';
+      return;
+    }
+  }
+
+  pdfFileBaseName = (file.name || "pdf_extracted_data").replace(/\.[^.]+$/, "") || "pdf_extracted_data";
+
   pdfDoc = null;
+  multiPdfDocs = [];
+  isMultiPdfMode = false;
   currentPage = 1;
   scale = 1.5;
   selectedRegionIds = [];
@@ -199,17 +277,146 @@ fileInput?.addEventListener("change", async (e) => {
 
   const reader = new FileReader();
   reader.onload = async () => {
-    const data = new Uint8Array(reader.result);
-    pdfDoc = await pdfjsLib.getDocument(data).promise;
-    await buildThumbnails();
-    await renderPage(1);
+    try {
+      const data = new Uint8Array(reader.result);
+      console.log('📂 Loading PDF document...');
+      
+      const loadingTask = pdfjsLib.getDocument({
+        data: data,
+        cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+        cMapPacked: true,
+        disableAutoFetch: true,
+        disableStream: false,
+        disableFontFace: false,
+        useSystemFonts: false,
+        standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/',
+      });
+      
+      pdfDoc = await loadingTask.promise;
+      const pageCount = pdfDoc.numPages;
+      console.log(`✅ PDF loaded: ${pageCount} pages (${fileSizeMB.toFixed(1)} MB)`);
+      
+      if (pageCount === 0) {
+        throw new Error('PDF has 0 pages');
+      }
+      
+      try {
+        const testPage = await pdfDoc.getPage(1);
+        console.log(`📄 Page 1 dimensions: ${testPage.view[2]} x ${testPage.view[3]}`);
+        testPage.cleanup();
+      } catch (err) {
+        console.error('❌ Cannot read first page:', err);
+        throw new Error('PDF appears corrupted');
+      }
+      
+      if (pageCount === 1 && file.size > 1000000) {
+        console.warn('⚠️ Large file but only 1 page detected');
+      }
+      
+      console.log(`🖼️ Starting thumbnail build for ${pageCount} pages...`);
+      await buildThumbnails();
+      console.log('📄 Rendering first page...');
+      await renderPage(1);
+      console.log('✅ PDF ready');
+    } catch (err) {
+      console.error('❌ Error loading PDF:', err);
+      alert(`Failed to load PDF: ${err.message}`);
+      fileInput.value = '';
+    }
   };
+  
+  reader.onerror = () => {
+    console.error('❌ Error reading file');
+    alert('Failed to read the PDF file');
+    fileInput.value = '';
+  };
+  
   reader.readAsArrayBuffer(file);
 });
 
-/* ============================================================
-   MANUAL OVERRIDES (document fields)
-   ============================================================ */
+async function loadMultiplePDFs(files) {
+  console.log(`📚 Loading ${files.length} separate PDF files as one combined document...`);
+  
+  pdfDoc = null;
+  multiPdfDocs = [];
+  isMultiPdfMode = true;
+  currentPage = 1;
+  scale = 1.5;
+  selectedRegionIds = [];
+  selectedRegionId = null;
+  regionIdCounter = 1;
+
+  for (const k of Object.keys(documentDetails)) documentDetails[k] = "";
+  for (const k of Object.keys(sheetDetailsByPage)) delete sheetDetailsByPage[k];
+  for (const k of Object.keys(regionsByPage)) delete regionsByPage[k];
+  for (const k of Object.keys(regionTemplates)) delete regionTemplates[k];
+
+  if (preparedByInput) preparedByInput.value = "";
+  if (projectIdInput) projectIdInput.value = "";
+
+  pdfFileBaseName = "combined_pdfs";
+  let totalPages = 0;
+  let pageOffset = 0;
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    console.log(`  📄 Loading file ${i + 1}/${files.length}: ${file.name}`);
+
+    try {
+      const data = await file.arrayBuffer();
+      const uint8Data = new Uint8Array(data);
+
+      const loadingTask = pdfjsLib.getDocument({
+        data: uint8Data,
+        cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+        cMapPacked: true,
+        disableAutoFetch: true,
+        disableStream: false,
+        disableFontFace: false,
+      });
+
+      const doc = await loadingTask.promise;
+      
+      multiPdfDocs.push({
+        doc: doc,
+        pageOffset: pageOffset,
+        fileName: file.name,
+        pageCount: doc.numPages,
+      });
+
+      console.log(`    ✅ ${file.name}: ${doc.numPages} page(s)`);
+      totalPages += doc.numPages;
+      pageOffset += doc.numPages;
+
+    } catch (err) {
+      console.error(`    ❌ Failed to load ${file.name}:`, err);
+      alert(`Failed to load ${file.name}: ${err.message}`);
+      fileInput.value = '';
+      return;
+    }
+  }
+
+  console.log(`✅ All PDFs loaded: ${totalPages} total pages from ${files.length} files`);
+
+  pdfDoc = {
+    numPages: totalPages,
+    getPage: async (pageNum) => {
+      for (const pdf of multiPdfDocs) {
+        const localPageNum = pageNum - pdf.pageOffset;
+        if (localPageNum >= 1 && localPageNum <= pdf.pageCount) {
+          return await pdf.doc.getPage(localPageNum);
+        }
+      }
+      throw new Error(`Page ${pageNum} not found`);
+    },
+  };
+
+  console.log(`🖼️ Building thumbnails for ${totalPages} combined pages...`);
+  await buildThumbnails();
+  console.log('📄 Rendering first page...');
+  await renderPage(1);
+  console.log('✅ Combined PDF ready');
+}
 
 preparedByInput?.addEventListener("input", () => {
   documentDetails.prepared_by = preparedByInput.value || "";
@@ -219,134 +426,267 @@ projectIdInput?.addEventListener("input", () => {
   documentDetails.project_id = projectIdInput.value || "";
 });
 
-/* ============================================================
-   RENDER PAGE
-   ============================================================ */
-
 async function renderPage(pageNum) {
   if (!pdfDoc) return;
+
+  if (currentRenderTask) {
+    console.log('🛑 Cancelling previous render');
+    currentRenderTask.cancel();
+    currentRenderTask = null;
+  }
 
   currentPage = pageNum;
   selectedRegionIds = [];
   selectedRegionId = null;
 
-  const page = await pdfDoc.getPage(pageNum);
-  const viewport = page.getViewport({ scale });
+  ctx.clearRect(0, 0, canvas.width || 800, canvas.height || 600);
+  ctx.fillStyle = '#f0f0f0';
+  ctx.fillRect(0, 0, canvas.width || 800, canvas.height || 600);
+  ctx.fillStyle = '#666';
+  ctx.font = '16px sans-serif';
+  ctx.fillText('Loading...', 20, 40);
 
+  let page;
+  try {
+    page = await pdfDoc.getPage(pageNum);
+  } catch (err) {
+    console.error(`Error loading page ${pageNum}:`, err);
+    ctx.fillStyle = '#f44336';
+    ctx.fillText(`Error loading page ${pageNum}`, 20, 40);
+    return;
+  }
+  
+  // const MAX_CANVAS_DIMENSION = 3072;
+  // const MAX_CANVAS_DIMENSION = 5120;
+  // const MAX_CANVAS_DIMENSION = 8192;
+  const MAX_CANVAS_DIMENSION = 16384;
+  let effectiveScale = scale;
+  
+  const baseViewport = page.getViewport({ scale: 1.0 });
+  const targetWidth = baseViewport.width * scale;
+  const targetHeight = baseViewport.height * scale;
+  
+  if (targetWidth > MAX_CANVAS_DIMENSION || targetHeight > MAX_CANVAS_DIMENSION) {
+    const scaleX = MAX_CANVAS_DIMENSION / baseViewport.width;
+    const scaleY = MAX_CANVAS_DIMENSION / baseViewport.height;
+    effectiveScale = Math.min(scaleX, scaleY, scale);
+    console.warn(`⚠️ Large page detected. Limiting scale to ${effectiveScale.toFixed(2)} (requested: ${scale.toFixed(2)})`);
+  }
+  
+  const viewport = page.getViewport({ scale: effectiveScale });
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-
   overlay.setAttribute("width", viewport.width);
   overlay.setAttribute("height", viewport.height);
 
-  await page.render({ canvasContext: ctx, viewport }).promise;
+  try {
+    currentRenderTask = page.render({ 
+      canvasContext: ctx, 
+      viewport,
+      intent: 'display',
+      renderInteractiveForms: false,
+      enableWebGL: false,
+    });
+    
+    await currentRenderTask.promise;
+    currentRenderTask = null;
+  } catch (err) {
+    if (err.name === 'RenderingCancelledException') {
+      console.log('⏭️ Render cancelled');
+      return;
+    }
+    console.error(`❌ Error rendering page ${pageNum}:`, err);
+    ctx.fillStyle = '#f44336';
+    ctx.font = '20px sans-serif';
+    ctx.fillText(`Error rendering page ${pageNum}`, 20, 40);
+    ctx.fillText('Try reducing zoom or reloading', 20, 70);
+  }
 
   if (pageIndicator) {
-    pageIndicator.textContent = `Page ${currentPage} / ${pdfDoc.numPages}`;
+  pageIndicator.textContent = `Page ${currentPage} / ${pdfDoc.numPages} (${(scale * 100).toFixed(0)}%)`;
   }
 
   highlightActiveThumb();
   redrawRegions();
+  
+  if (page && page.cleanup) {
+    page.cleanup();
+  }
+  page = null;
 }
-
-/* ============================================================
-   ZOOM BUTTONS
-   ============================================================ */
 
 zoomInBtn?.addEventListener("click", () => {
   scale *= 1.1;
+  scale = Math.min(scale, 20.0); // Increased from 3.0 to 20.0
+  
+  // Warn user about high memory usage
+  if (scale > 5.0 && scale % 1 < 0.2) { // Only warn occasionally
+    console.warn(`⚠️ High zoom level: ${scale.toFixed(1)}x - May use significant memory`);
+  }
+  
   renderPage(currentPage);
 });
 
 zoomOutBtn?.addEventListener("click", () => {
   scale /= 1.1;
+  scale = Math.max(scale, 0.3);
   renderPage(currentPage);
 });
 
-/* ============================================================
-   THUMBNAILS
-   ============================================================ */
-
 async function buildThumbnails() {
-  if (!pdfDoc || !sidebar) return;
-
-  sidebar.innerHTML = "";
-
-  for (let i = 1; i <= pdfDoc.numPages; i++) {
-    const page = await pdfDoc.getPage(i);
-    const viewport = page.getViewport({ scale: 0.2 });
-
-    const c = document.createElement("canvas");
-    c.width = viewport.width;
-    c.height = viewport.height;
-    c.classList.add("thumb");
-
-    await page.render({ canvasContext: c.getContext("2d"), viewport }).promise;
-
-    c.addEventListener("click", () => renderPage(i));
-    sidebar.appendChild(c);
+  if (!pdfDoc || !sidebar) {
+    console.error('❌ buildThumbnails: pdfDoc or sidebar is null!');
+    return;
   }
 
+  const numPages = pdfDoc.numPages;
+  console.log(`🖼️ Building thumbnails for ${numPages} pages...`);
+
+  sidebar.innerHTML = "";
+  
+  for (let i = 1; i <= numPages; i++) {
+    const placeholder = document.createElement("div");
+    placeholder.classList.add("thumb");
+    placeholder.style.cssText = `
+  background: #555;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  box-sizing: border-box;
+`;
+    placeholder.textContent = `Page ${i}`;
+    placeholder.dataset.pageNum = i;
+    placeholder.addEventListener("click", () => {
+      console.log(`👆 Clicked thumbnail ${i}`);
+      renderPage(i);
+    });
+    sidebar.appendChild(placeholder);
+  }
+  
+  const placeholderCount = sidebar.querySelectorAll('.thumb').length;
+  console.log(`✅ Created ${placeholderCount} placeholder thumbnails`);
+  
+  if (placeholderCount !== numPages) {
+    console.error(`❌ Mismatch! Expected ${numPages}, got ${placeholderCount}`);
+  }
+  
   highlightActiveThumb();
+  
+  if (numPages > 10) {
+    console.log('📄 Large PDF - lazy loading thumbnails');
+    for (let i = 1; i <= Math.min(3, numPages); i++) {
+      await loadThumbnail(i);
+    }
+    return;
+  }
+  
+  console.log('📄 Loading all thumbnails...');
+  for (let i = 1; i <= numPages; i++) {
+    await loadThumbnail(i);
+    if (i % 3 === 0) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
+  console.log('✅ All thumbnails loaded');
+}
+
+async function loadThumbnail(pageNum) {
+  if (thumbnailDataCache.has(pageNum)) return;
+  
+  try {
+    const page = await pdfDoc.getPage(pageNum);
+    const THUMB_SCALE = 0.12;
+    const viewport = page.getViewport({ scale: THUMB_SCALE });
+
+    const tempCanvas = document.createElement("canvas");
+    const maxWidth = 180;
+    const scaleFactor = Math.min(1, maxWidth / viewport.width);
+    tempCanvas.width = viewport.width * scaleFactor;
+    tempCanvas.height = viewport.height * scaleFactor;
+    
+    const tempCtx = tempCanvas.getContext("2d", { alpha: false });
+
+    await page.render({ 
+      canvasContext: tempCtx, 
+      viewport: page.getViewport({ scale: tempCanvas.width / page.getViewport({ scale: 1 }).width }),
+      intent: 'display',
+      renderInteractiveForms: false,
+    }).promise;
+
+    const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.7);
+    thumbnailDataCache.set(pageNum, dataUrl);
+    
+    const placeholder = sidebar.querySelector(`div.thumb[data-page-num="${pageNum}"]`);
+    if (placeholder) {
+      const img = document.createElement('img');
+      img.src = dataUrl;
+      img.style.cssText = 'width: 100%; height: auto; display: block;';
+      placeholder.innerHTML = '';
+      placeholder.appendChild(img);
+      placeholder.style.background = '#444';
+    } else {
+      console.warn(`Could not find placeholder for page ${pageNum}`);
+    }
+    
+    page.cleanup();
+    tempCanvas.width = 0;
+    tempCanvas.height = 0;
+    
+  } catch (err) {
+    console.error(`Error loading thumbnail ${pageNum}:`, err);
+  }
 }
 
 function highlightActiveThumb() {
-  document.querySelectorAll(".thumb").forEach((t, i) =>
-    t.classList.toggle("active", i + 1 === currentPage)
-  );
+  const thumbs = sidebar.querySelectorAll(".thumb");
+  thumbs.forEach((t, i) => {
+    const isActive = (i + 1) === currentPage;
+    if (isActive) {
+      t.style.borderColor = '#4da3ff';
+      const pageNum = i + 1;
+      if (pdfDoc && pdfDoc.numPages > 10) {
+        loadThumbnail(pageNum);
+        if (pageNum > 1) loadThumbnail(pageNum - 1);
+        if (pageNum < pdfDoc.numPages) loadThumbnail(pageNum + 1);
+      }
+    } else {
+      t.style.borderColor = 'transparent';
+    }
+  });
 }
-
-/* ============================================================
-   REGION DRAWING + SELECTION
-   ============================================================ */
-
-let isDrawing = false;
-let startX = 0;
-let startY = 0;
-let activeRect = null;
-
-// --- Drag-move selected regions
-let isDraggingRegions = false;
-let dragStartPx = { x: 0, y: 0 };
-let dragHasMoved = false;
-let dragClickShouldToggleOff = false;
-let dragStartById = new Map();
 
 function getOverlayPoint(evt) {
   const r = overlay.getBoundingClientRect();
   return { x: evt.clientX - r.left, y: evt.clientY - r.top };
 }
 
-// Track last pointer position over the overlay for "Shift+Paste at pointer"
 function updateLastPointerNormFromEvent(evt) {
   if (!overlay) return;
   const r = overlay.getBoundingClientRect();
   const xPx = evt.clientX - r.left;
   const yPx = evt.clientY - r.top;
-
-  // only update when pointer is over the overlay
   if (xPx < 0 || yPx < 0 || xPx > r.width || yPx > r.height) return;
-
   const x = r.width ? xPx / r.width : 0;
   const y = r.height ? yPx / r.height : 0;
-
   const cx = x < 0 ? 0 : x > 1 ? 1 : x;
   const cy = y < 0 ? 0 : y > 1 ? 1 : y;
   lastPointerNorm = { x: cx, y: cy };
 }
 
-// Passive global listener so Shift+Cmd/Ctrl+V works without extra clicks
 window.addEventListener("mousemove", updateLastPointerNormFromEvent, { passive: true });
 
 function beginRegionDrag(evt, clickShouldToggleOff) {
   if (!overlay) return;
-
+  saveUndoState(); // Save state BEFORE dragging starts
   isDraggingRegions = true;
   dragHasMoved = false;
   dragClickShouldToggleOff = !!clickShouldToggleOff;
   dragStartPx = getOverlayPoint(evt);
-
-  // Snapshot starting positions for all selected regions (normalized)
   dragStartById = new Map();
   const regs = regionsByPage[currentPage] || [];
   const sel = new Set(selectedRegionIds);
@@ -355,8 +695,6 @@ function beginRegionDrag(evt, clickShouldToggleOff) {
       dragStartById.set(r.id, { x: r.x, y: r.y, w: r.w, h: r.h });
     }
   });
-
-  // Track move/end even if pointer leaves the overlay
   window.addEventListener("mousemove", onRegionDragMove, true);
   window.addEventListener("mouseup", onRegionDragEnd, true);
 }
@@ -364,98 +702,78 @@ function beginRegionDrag(evt, clickShouldToggleOff) {
 function onRegionDragMove(evt) {
   if (!isDraggingRegions) return;
   if (!canvas.width || !canvas.height) return;
-
   const p = getOverlayPoint(evt);
   const dxPx = p.x - dragStartPx.x;
   const dyPx = p.y - dragStartPx.y;
-
   if (!dragHasMoved && (Math.abs(dxPx) > 2 || Math.abs(dyPx) > 2)) {
     dragHasMoved = true;
   }
-
   let dx = dxPx / canvas.width;
   let dy = dyPx / canvas.height;
-
-  // Clamp as a GROUP so relative spacing is preserved.
   let minDx = -Infinity, maxDx = Infinity;
   let minDy = -Infinity, maxDy = Infinity;
-
   dragStartById.forEach(({ x, y, w, h }) => {
     minDx = Math.max(minDx, -x);
     maxDx = Math.min(maxDx, (1 - w) - x);
     minDy = Math.max(minDy, -y);
     maxDy = Math.min(maxDy, (1 - h) - y);
   });
-
   dx = Math.min(Math.max(dx, minDx), maxDx);
   dy = Math.min(Math.max(dy, minDy), maxDy);
-
   const regs = regionsByPage[currentPage] || [];
   const byId = new Map(regs.map(r => [r.id, r]));
-
   dragStartById.forEach((s, id) => {
     const r = byId.get(id);
     if (!r) return;
     r.x = s.x + dx;
     r.y = s.y + dy;
   });
-
   redrawRegions();
 }
 
 function onRegionDragEnd() {
   if (!isDraggingRegions) return;
-
   window.removeEventListener("mousemove", onRegionDragMove, true);
   window.removeEventListener("mouseup", onRegionDragEnd, true);
-
   const shouldToggleOff = dragClickShouldToggleOff && !dragHasMoved;
-
-  // FIX: Invalidate moved regions
   if (dragHasMoved) {
     const regs = regionsByPage[currentPage] || [];
     const byId = new Map(regs.map(r => [r.id, r]));
     const changedTypes = [...new Set(selectedRegionIds.map(id => byId.get(id)?.type).filter(Boolean))];
     invalidatePageFields(currentPage, changedTypes);
   }
-
   isDraggingRegions = false;
   dragClickShouldToggleOff = false;
   dragStartById = new Map();
-
   if (shouldToggleOff) {
     clearSelection();
   }
-
   redrawRegions();
 }
 
-
 overlay?.addEventListener("mousedown", (e) => {
-  // Click on an existing region selects/drag-moves it (handled by rect listener)
   if (e.target?.tagName === "rect") return;
   if (isDraggingRegions) return;
-
+  if (isDrawing && activeRect) return;
   isDrawing = true;
   selectedRegionIds = [];
   selectedRegionId = null;
-
   const r = overlay.getBoundingClientRect();
   startX = e.clientX - r.left;
   startY = e.clientY - r.top;
-
   activeRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  activeRect.setAttribute("fill", "rgba(0, 123, 255, 0.2)");
+  activeRect.setAttribute("stroke", "#007bff");
+  activeRect.setAttribute("stroke-width", "2");
   overlay.appendChild(activeRect);
 });
 
 overlay?.addEventListener("mousemove", (e) => {
-  if (isDraggingRegions) return; // drag handled on window
+  if (isDraggingRegions) return;
   if (!isDrawing || !activeRect) return;
-
   const r = overlay.getBoundingClientRect();
   const x = e.clientX - r.left;
   const y = e.clientY - r.top;
-
   activeRect.setAttribute("x", Math.min(startX, x));
   activeRect.setAttribute("y", Math.min(startY, y));
   activeRect.setAttribute("width", Math.abs(x - startX));
@@ -463,130 +781,120 @@ overlay?.addEventListener("mousemove", (e) => {
 });
 
 overlay?.addEventListener("mouseup", () => {
-  if (isDraggingRegions) return; // drag handled on window
+  if (isDraggingRegions) return;
   if (!isDrawing || !activeRect) return;
+  const x = +(activeRect.getAttribute("x") || 0);
+  const y = +(activeRect.getAttribute("y") || 0);
+  const w = +(activeRect.getAttribute("width") || 0);
+  const h = +(activeRect.getAttribute("height") || 0);
+  activeRect.remove();
   isDrawing = false;
-
-  const w = +activeRect.getAttribute("width");
-  const h = +activeRect.getAttribute("height");
-
+  activeRect = null;
   if (w < 2 || h < 2) {
-    activeRect.remove();
-    activeRect = null;
     return;
   }
-
   const region = {
     id: regionIdCounter++,
     type: regionTypeSelect?.value || REGION_TYPES[0],
-    x: +activeRect.getAttribute("x") / canvas.width,
-    y: +activeRect.getAttribute("y") / canvas.height,
+    x: x / canvas.width,
+    y: y / canvas.height,
     w: w / canvas.width,
     h: h / canvas.height,
   };
+  saveUndoState(); // Save state BEFORE making changes
 
-  if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
-  regionsByPage[currentPage].push(region);
-  
-  invalidatePageFields(currentPage, [region.type]);
-
-  activeRect = null;
+if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
+regionsByPage[currentPage].push(region);
+invalidatePageFields(currentPage, [region.type]);
+if (REGION_TYPES.includes(region.type)) {
+  if (TEMPLATE_MASTER_PAGE === null) {
+    TEMPLATE_MASTER_PAGE = currentPage;
+    console.log(`📐 Master page set to: ${TEMPLATE_MASTER_PAGE}`);
+  }
+    promoteRegionToTemplate(region);
+    console.log(`✨ Auto-promoted "${region.type}" to template`);
+  }
   redrawRegions();
 });
 
 function redrawRegions() {
   if (!overlay) return;
-
   overlay.innerHTML = "";
-
+  
+  // Clear previous ghost regions from current page before redrawing
   const pageRegions = regionsByPage[currentPage] || [];
+  regionsByPage[currentPage] = pageRegions.filter(r => !r.isGhost);
+  
+  // Get fresh list after filtering ghosts
+  const currentPageRegions = regionsByPage[currentPage] || [];
+  
+  // Add ghost regions from templates (if they don't have page-specific overrides)
+  Object.values(regionTemplates).forEach((tpl) => {
+    const hasOverride = currentPageRegions.some((r) => r.type === tpl.type && !r.isGhost);
+    if (hasOverride) return;
 
-  // 1) Draw real (page-specific) regions
-  pageRegions.forEach((r) => {
+    // Create editable ghost region from template
+    const ghostRegion = {
+      id: regionIdCounter++,
+      type: tpl.type,
+      x: tpl.x,
+      y: tpl.y,
+      w: tpl.w,
+      h: tpl.h,
+      isGhost: true,
+    };
+
+    currentPageRegions.push(ghostRegion);
+  });
+  
+  // Draw all regions (real + ghosts)
+  currentPageRegions.forEach((r) => {
     const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     rect.setAttribute("x", r.x * canvas.width);
     rect.setAttribute("y", r.y * canvas.height);
     rect.setAttribute("width", r.w * canvas.width);
     rect.setAttribute("height", r.h * canvas.height);
-
     rect.dataset.id = String(r.id);
     rect.dataset.type = r.type;
-
+    
+    // Visual indicator for ghost regions
+    if (r.isGhost) {
+      rect.setAttribute("stroke-dasharray", "6 4");
+      rect.setAttribute("opacity", "0.7");
+    }
+    
     if (selectedRegionIds.includes(r.id)) rect.classList.add("selected");
-
+    
     rect.addEventListener("mousedown", (e) => {
       e.stopPropagation();
-
-      // Multi-select toggle (no drag)
       if (e.shiftKey) {
         toggleSelection(r.id);
         redrawRegions();
         return;
       }
-
-      // Record click intent BEFORE any selection changes
       const preWasSelected = selectedRegionIds.includes(r.id);
       const preWasSingleSame = (selectedRegionIds.length === 1 && selectedRegionIds[0] === r.id);
       const preWasMulti = selectedRegionIds.length > 1;
-
-      // Click behaviour:
-      // - if clicking an UNSELECTED region, switch to single-select (and drag that)
-      // - if clicking a SELECTED region, preserve selection so multi-select can drag as a group
       if (!preWasSelected) {
         setSingleSelection(r.id);
         redrawRegions();
         beginRegionDrag(e, false);
         return;
       }
-
       if (preWasMulti) {
-        // Keep the multi-selection intact; dragging any selected member moves the group.
         beginRegionDrag(e, false);
         redrawRegions();
         return;
       }
-
-      // preWasSingleSame: click again should toggle OFF unless user drags
-      // We defer the toggle-off to mouseup if there was no drag movement.
-      // Start drag tracking either way.
       beginRegionDrag(e, preWasSingleSame);
       redrawRegions();
     });
-
     overlay.appendChild(rect);
-  });
-
-  // 2) Draw ghost template regions (only where no override exists on this page)
-  Object.values(regionTemplates).forEach((tpl) => {
-    const hasOverrideOnThisPage = pageRegions.some((r) => r.type === tpl.type);
-    if (hasOverrideOnThisPage) return;
-
-    const ghost = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-    ghost.setAttribute("x", tpl.x * canvas.width);
-    ghost.setAttribute("y", tpl.y * canvas.height);
-    ghost.setAttribute("width", tpl.w * canvas.width);
-    ghost.setAttribute("height", tpl.h * canvas.height);
-
-    ghost.dataset.type = tpl.type;
-    ghost.setAttribute("fill", "none");
-    ghost.setAttribute("stroke-width", "1");
-    ghost.setAttribute("stroke-dasharray", "6 4");
-    ghost.setAttribute("opacity", "0.45");
-    ghost.style.pointerEvents = "none";
-
-    overlay.appendChild(ghost);
   });
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
 function syncLegacySelectedId() {
-  selectedRegionId =
-    selectedRegionIds.length > 0
-      ? selectedRegionIds[selectedRegionIds.length - 1]
-      : null;
+  selectedRegionId = selectedRegionIds.length > 0 ? selectedRegionIds[selectedRegionIds.length - 1] : null;
 }
 
 function setSingleSelection(id) {
@@ -632,10 +940,8 @@ function getSelectedRegionsOnCurrentPage() {
 function copySelectionToClipboard() {
   const regs = getSelectedRegionsOnCurrentPage();
   if (!regs.length) return false;
-
   const minX = Math.min(...regs.map((r) => r.x));
   const minY = Math.min(...regs.map((r) => r.y));
-
   clipboardBase = { minX, minY };
   clipboardRegions = regs.map((r) => ({
     type: r.type,
@@ -644,7 +950,6 @@ function copySelectionToClipboard() {
     w: r.w,
     h: r.h,
   }));
-
   clipboardPasteSerial = 0;
   console.log(`📋 Copied ${clipboardRegions.length} region(s)`);
   return true;
@@ -652,57 +957,48 @@ function copySelectionToClipboard() {
 
 function pasteClipboardToCurrentPage() {
   if (!clipboardRegions.length || !clipboardBase) return false;
-
-  // FIX: Invalidate pasted field types on target page
   const changedTypes = [...new Set(clipboardRegions.map(r => r.type))];
   invalidatePageFields(currentPage, changedTypes);
-
-  // Nudge each paste so it's visible
   clipboardPasteSerial += 1;
   const nudgePx = 10 * clipboardPasteSerial;
   const nudgeX = canvas.width ? nudgePx / canvas.width : 0.01;
   const nudgeY = canvas.height ? nudgePx / canvas.height : 0.01;
-
   const baseX = clipboardBase.minX + nudgeX;
   const baseY = clipboardBase.minY + nudgeY;
-
   if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
-
   const newIds = [];
-
   clipboardRegions.forEach((it) => {
     const id = regionIdCounter++;
-
     let x = baseX + it.dx;
     let y = baseY + it.dy;
-
-    // keep within page bounds
     x = clamp01(x);
     y = clamp01(y);
     x = Math.min(x, 1 - it.w);
     y = Math.min(y, 1 - it.h);
-
-    regionsByPage[currentPage].push({
+    const newRegion = {
       id,
       type: it.type,
       x,
       y,
       w: it.w,
       h: it.h,
-    });
-
+    };
+    regionsByPage[currentPage].push(newRegion);
+    if (REGION_TYPES.includes(newRegion.type)) {
+      if (TEMPLATE_MASTER_PAGE === null) {
+        TEMPLATE_MASTER_PAGE = currentPage;
+      }
+      promoteRegionToTemplate(newRegion);
+    }
     newIds.push(id);
   });
-
   selectedRegionIds = newIds;
   syncLegacySelectedId();
   redrawRegions();
-
   console.log(`📋 Pasted ${newIds.length} region(s) onto page ${currentPage}`);
   return true;
 }
 
-// Invalidate cached fields when region geometry changes
 function invalidatePageFields(pageNum, types) {
   if (!sheetDetailsByPage[pageNum]) return;
   types.forEach(t => {
@@ -716,52 +1012,44 @@ function invalidatePageFields(pageNum, types) {
 function pasteClipboardToCurrentPageAtPointer() {
   if (!clipboardRegions.length || !clipboardBase) return false;
   if (!lastPointerNorm) return pasteClipboardToCurrentPage();
-
-  // FIX: Invalidate pasted field types on target page
   const changedTypes = [...new Set(clipboardRegions.map(r => r.type))];
   invalidatePageFields(currentPage, changedTypes);
-
-  // Align the group's top-left (clipboardBase) to the current pointer
   let baseX = lastPointerNorm.x;
   let baseY = lastPointerNorm.y;
-
-  // Clamp as a GROUP so the whole pasted set stays on-page
   let groupMaxX = 0;
   let groupMaxY = 0;
   clipboardRegions.forEach((it) => {
     groupMaxX = Math.max(groupMaxX, it.dx + it.w);
     groupMaxY = Math.max(groupMaxY, it.dy + it.h);
   });
-
   baseX = Math.min(Math.max(baseX, 0), Math.max(0, 1 - groupMaxX));
   baseY = Math.min(Math.max(baseY, 0), Math.max(0, 1 - groupMaxY));
-
   if (!regionsByPage[currentPage]) regionsByPage[currentPage] = [];
-
   const newIds = [];
-
   clipboardRegions.forEach((it) => {
     const id = regionIdCounter++;
-
     const x = baseX + it.dx;
     const y = baseY + it.dy;
-
-    regionsByPage[currentPage].push({
+    const newRegion = {
       id,
       type: it.type,
       x,
       y,
       w: it.w,
       h: it.h,
-    });
-
+    };
+    regionsByPage[currentPage].push(newRegion);
+    if (REGION_TYPES.includes(newRegion.type)) {
+      if (TEMPLATE_MASTER_PAGE === null) {
+        TEMPLATE_MASTER_PAGE = currentPage;
+      }
+      promoteRegionToTemplate(newRegion);
+    }
     newIds.push(id);
   });
-
   selectedRegionIds = newIds;
   syncLegacySelectedId();
   redrawRegions();
-
   console.log(`📋 Pasted ${newIds.length} region(s) at pointer onto page ${currentPage}`);
   return true;
 }
@@ -784,7 +1072,6 @@ function resolveRegionForPage(pageNum, type) {
 
 function promoteRegionToTemplate(region) {
   if (!region || !region.type) return;
-
   regionTemplates[region.type] = {
     type: region.type,
     x: region.x,
@@ -792,24 +1079,13 @@ function promoteRegionToTemplate(region) {
     w: region.w,
     h: region.h,
   };
-
-  console.log(`📐 Template set for "${region.type}"`, regionTemplates[region.type]);
+  console.log(`📐 Template set for "${region.type}" at (${(region.x * 100).toFixed(1)}%, ${(region.y * 100).toFixed(1)}%) - will appear on all pages`);
 }
-
-/* ============================================================
-   OCR POST-PROCESSING + MULTI-PASS (PSM) - IMPROVED
-   ============================================================ */
 
 function isIdLikeField(field) {
   return field === "sheet_id" || field === "issue_id" || field === "project_id" || field === "date";
 }
 
-/**
- * IMPROVED: Field-specific preprocessing with better algorithms
- * - Contrast stretching for all fields
- * - Adaptive thresholding for ID fields (better than global threshold)
- * - Sharpening filter for text fields
- */
 function preprocessOcrCrop(canvasEl, field) {
   try {
     const c = canvasEl.getContext("2d");
@@ -818,13 +1094,11 @@ function preprocessOcrCrop(canvasEl, field) {
     const img = c.getImageData(0, 0, w, h);
     const d = img.data;
 
-    // Step 1: Grayscale conversion
     for (let i = 0; i < d.length; i += 4) {
       const g = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
       d[i] = d[i + 1] = d[i + 2] = g;
     }
 
-    // Step 2: Contrast enhancement (stretch histogram)
     let min = 255, max = 0;
     for (let i = 0; i < d.length; i += 4) {
       const v = d[i];
@@ -833,26 +1107,21 @@ function preprocessOcrCrop(canvasEl, field) {
     }
     
     const range = max - min;
-    if (range > 10) { // Only stretch if there's meaningful contrast
+    if (range > 10) {
       for (let i = 0; i < d.length; i += 4) {
         const stretched = ((d[i] - min) * 255 / range) | 0;
         d[i] = d[i + 1] = d[i + 2] = stretched;
       }
     }
 
-    // Step 3: Adaptive thresholding for ID-like fields (better than global threshold)
     if (isIdLikeField(field)) {
-      const blockSize = 15; // Local neighborhood size
-      const C = 10; // Constant subtracted from mean
-      
-      // Create a temporary copy for reading
+      const blockSize = 15;
+      const C = 10;
       const original = new Uint8ClampedArray(d);
       
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
           const idx = (y * w + x) * 4;
-          
-          // Calculate local mean
           let sum = 0;
           let count = 0;
           const halfBlock = Math.floor(blockSize / 2);
@@ -867,12 +1136,10 @@ function preprocessOcrCrop(canvasEl, field) {
           const localMean = sum / count;
           const threshold = localMean - C;
           const v = original[idx] > threshold ? 255 : 0;
-          
           d[idx] = d[idx + 1] = d[idx + 2] = v;
         }
       }
     } else {
-      // For text fields: gentle sharpening to improve edge definition
       const sharpen = [-1, -1, -1, -1, 9, -1, -1, -1, -1];
       const original = new Uint8ClampedArray(d);
       
@@ -907,20 +1174,17 @@ function cleanByField(field, raw) {
   if (!t) return "";
 
   if (field === "date") {
-    // First date-like token (AU drawings often use dd/mm/yyyy or dd-mm-yy)
     const m = t.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/);
     return m ? m[1] : t;
   }
 
   if (field === "issue_id") {
-    // If OCR captured a date too, strip it first, then keep the most "id-ish" token.
     const withoutDate = t.replace(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g, " ").trim();
     const m = withoutDate.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
     return m ? m[0] : (withoutDate || t);
   }
 
   if (field === "sheet_id") {
-    // Prefer compact token (common formats: A101, 00, SK-01, etc.)
     const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
     return m ? m[0] : t;
   }
@@ -930,13 +1194,9 @@ function cleanByField(field, raw) {
     return m ? m[0] : t;
   }
 
-  // prepared_by, description, issue_description: keep normalized text
   return t;
 }
 
-/**
- * IMPROVED: More PSM variations for better results
- */
 function _ocrPassConfigs(field) {
   if (field === "sheet_id" || field === "issue_id" || field === "project_id") {
     return [
@@ -956,7 +1216,6 @@ function _ocrPassConfigs(field) {
     ];
   }
 
-  // Text fields: more PSM modes without restrictive whitelists
   return [
     { psm: "6", whitelist: null, label: "block" },
     { psm: "7", whitelist: null, label: "line" },
@@ -965,9 +1224,6 @@ function _ocrPassConfigs(field) {
   ];
 }
 
-/**
- * IMPROVED: Better parameter management
- */
 async function _setOcrParams(worker, field, psm, whitelist) {
   const params = {
     user_defined_dpi: "300",
@@ -987,7 +1243,6 @@ async function _setOcrParams(worker, field, psm, whitelist) {
 }
 
 function _scoreOcrCandidate(text, confidence) {
-  // Confidence is sometimes 0/NaN in tesseract.js; combine with length as a tiebreaker.
   const c = Number.isFinite(confidence) ? confidence : 0;
   const len = _normText(text).length;
   return (c * 1000) + Math.min(200, len);
@@ -1012,10 +1267,6 @@ async function ocrRecognizeMultiPass(worker, blob, field) {
   return best;
 }
 
-/* ============================================================
-   VECTOR EXTRACTION
-   ============================================================ */
-
 async function extractVectorTextFromRegion(pageNum, region) {
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
@@ -1029,11 +1280,7 @@ async function extractVectorTextFromRegion(pageNum, region) {
   const strings = [];
 
   textContent.items.forEach((item) => {
-    const [, , , , tx, ty] = pdfjsLib.Util.transform(
-      viewport.transform,
-      item.transform
-    );
-
+    const [, , , , tx, ty] = pdfjsLib.Util.transform(viewport.transform, item.transform);
     if (tx >= xMin && tx <= xMax && ty >= yMin && ty <= yMax) {
       strings.push(item.str);
     }
@@ -1042,45 +1289,78 @@ async function extractVectorTextFromRegion(pageNum, region) {
   return strings.join(" ").replace(/\s+/g, " ").trim();
 }
 
-/* ============================================================
-   OCR EXTRACTION - IMPROVED
-   ============================================================ */
-
 async function extractOCRFromRegion(pageNum, region) {
-  const page = await pdfDoc.getPage(pageNum);
+  let page;
+  try {
+    page = await pdfDoc.getPage(pageNum);
+  } catch (err) {
+    console.error(`Error loading page ${pageNum} for OCR:`, err);
+    return "";
+  }
 
-  // IMPROVED: Higher resolution for better OCR (5.0x instead of 3.0x)
-  const OCR_SCALE = 5.0;
-  const viewport = page.getViewport({ scale: OCR_SCALE });
-
-  const offCanvas = document.createElement("canvas");
-  offCanvas.width = viewport.width;
-  offCanvas.height = viewport.height;
-
-  await page.render({
-    canvasContext: offCanvas.getContext("2d"),
-    viewport,
-  }).promise;
-
-  const crop = document.createElement("canvas");
-  const cropW = Math.max(1, Math.round(region.w * offCanvas.width));
-  const cropH = Math.max(1, Math.round(region.h * offCanvas.height));
+  const regionAreaPx = region.w * region.h * page.view[2] * page.view[3];
+  let OCR_SCALE;
   
-  // IMPROVED: Enforce minimum dimensions for OCR quality
+  if (regionAreaPx < 5000) {
+    OCR_SCALE = 5.0;
+  } else if (regionAreaPx < 20000) {
+    OCR_SCALE = 4.0;
+  } else if (regionAreaPx < 100000) {
+    OCR_SCALE = 3.0;
+  } else {
+    OCR_SCALE = 2.5;
+  }
+  
+  const viewport = page.getViewport({ scale: OCR_SCALE });
+  const offCanvas = document.createElement("canvas");
+  
+  const cropW = Math.max(1, Math.round(region.w * viewport.width));
+  const cropH = Math.max(1, Math.round(region.h * viewport.height));
+  
+  const MAX_OCR_DIMENSION = 2048;
+  let finalCropW = cropW;
+  let finalCropH = cropH;
+  
+  if (cropW > MAX_OCR_DIMENSION || cropH > MAX_OCR_DIMENSION) {
+    const scaleDown = Math.min(MAX_OCR_DIMENSION / cropW, MAX_OCR_DIMENSION / cropH);
+    finalCropW = Math.round(cropW * scaleDown);
+    finalCropH = Math.round(cropH * scaleDown);
+    console.warn(`⚠️ OCR region too large (${cropW}x${cropH}), scaling to ${finalCropW}x${finalCropH}`);
+  }
+  
   const MIN_OCR_WIDTH = 50;
   const MIN_OCR_HEIGHT = 20;
   
-  if (cropW < MIN_OCR_WIDTH || cropH < MIN_OCR_HEIGHT) {
-    console.warn(`⚠️ Region too small for OCR (${cropW}x${cropH}px). Min: ${MIN_OCR_WIDTH}x${MIN_OCR_HEIGHT}px`);
+  if (finalCropW < MIN_OCR_WIDTH || finalCropH < MIN_OCR_HEIGHT) {
+    console.warn(`⚠️ Region too small for OCR (${finalCropW}x${finalCropH}px)`);
+    if (page && page.cleanup) page.cleanup();
     return "";
   }
-  
-  crop.width = cropW;
-  crop.height = cropH;
 
-  const ctx = crop.getContext("2d");
-  
-  // IMPROVED: Use high-quality image smoothing
+  offCanvas.width = viewport.width;
+  offCanvas.height = viewport.height;
+
+  try {
+    await page.render({
+      canvasContext: offCanvas.getContext("2d", { alpha: false }),
+      viewport,
+      intent: 'print',
+      renderInteractiveForms: false,
+      enableWebGL: false,
+    }).promise;
+  } catch (err) {
+    console.error('Error rendering page for OCR:', err);
+    if (page && page.cleanup) page.cleanup();
+    offCanvas.width = 0;
+    offCanvas.height = 0;
+    return "";
+  }
+
+  const crop = document.createElement("canvas");
+  crop.width = finalCropW;
+  crop.height = finalCropH;
+
+  const ctx = crop.getContext("2d", { alpha: false });
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   
@@ -1092,55 +1372,88 @@ async function extractOCRFromRegion(pageNum, region) {
     cropH,
     0,
     0,
-    cropW,
-    cropH
+    finalCropW,
+    finalCropH
   );
+
+  offCanvas.width = 0;
+  offCanvas.height = 0;
 
   const field = (region && region.type) ? region.type : "";
   preprocessOcrCrop(crop, field);
 
   const worker = await getOcrWorker();
-
-  const blob = await new Promise((res) => crop.toBlob(res, "image/png"));
+  const blob = await new Promise((res) => crop.toBlob(res, "image/jpeg", 0.92));
+  
+  crop.width = 0;
+  crop.height = 0;
+  
+  if (page && page.cleanup) page.cleanup();
+  page = null;
+  
   if (!blob) return "";
 
-  // Multi-pass OCR (vary PSM) then field-specific cleanup
   return await runOcrExclusive(async () => {
     const best = await ocrRecognizeMultiPass(worker, blob, field);
     return cleanByField(field, best.text);
   });
 }
 
-/* ============================================================
-   APPLY TEMPLATES TO ALL PAGES
-   ============================================================ */
-
 async function applyTemplatesToAllPages(logProgress = false) {
   if (!pdfDoc) return;
 
-  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-    if (logProgress)
-      console.log(`🔍 Extracting page ${pageNum} / ${pdfDoc.numPages}`);
-    if (!sheetDetailsByPage[pageNum]) sheetDetailsByPage[pageNum] = {};
+  const templateCount = Object.keys(regionTemplates).length;
+  console.log(`📐 Active templates: ${templateCount}`, Object.keys(regionTemplates));
+  
+  if (templateCount === 0) {
+    console.warn("⚠️ No templates defined! Draw regions on a page first, then click Extract.");
+    return;
+  }
 
-    for (const field of REGION_TYPES) {
-      if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) continue;
+  const BATCH_SIZE = 3;
+  
+  for (let batchStart = 1; batchStart <= pdfDoc.numPages; batchStart += BATCH_SIZE) {
+    const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, pdfDoc.numPages);
+    
+    if (logProgress) {
+      console.log(`🔍 Extracting pages ${batchStart}-${batchEnd} / ${pdfDoc.numPages}`);
+    }
+    
+    for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
+      if (!sheetDetailsByPage[pageNum]) sheetDetailsByPage[pageNum] = {};
 
-      const region = resolveRegionForPage(pageNum, field);
-      if (!region) continue;
+      for (const field of REGION_TYPES) {
+        if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) continue;
 
-      let extracted = "";
+        const region = resolveRegionForPage(pageNum, field);
+        if (!region) {
+          console.warn(`⚠️ Page ${pageNum}: No region for "${field}"`);
+          continue;
+        }
 
-      if (ENABLE_VECTOR_EXTRACTION) {
-        extracted = await extractVectorTextFromRegion(pageNum, region);
+        let extracted = "";
+
+        if (ENABLE_VECTOR_EXTRACTION) {
+          extracted = await extractVectorTextFromRegion(pageNum, region);
+        }
+
+        if (!extracted) {
+          extracted = await extractOCRFromRegion(pageNum, region);
+        }
+
+        extracted = cleanByField(field, extracted);
+        sheetDetailsByPage[pageNum][field] = extracted || "";
+        
+        if (logProgress && extracted) {
+          console.log(`  ✓ Page ${pageNum} "${field}": "${extracted}"`);
+        }
       }
-
-      if (!extracted) {
-        extracted = await extractOCRFromRegion(pageNum, region);
-      }
-
-      extracted = cleanByField(field, extracted);
-      sheetDetailsByPage[pageNum][field] = extracted || "";
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    if (window.gc) {
+      window.gc();
     }
   }
 
@@ -1149,16 +1462,11 @@ async function applyTemplatesToAllPages(logProgress = false) {
 
 window.applyTemplatesToAllPages = applyTemplatesToAllPages;
 
-/* ============================================================
-   EXTRACT ALL (single button)
-   ============================================================ */
-
 async function extractAll() {
   if (!pdfDoc) return alert("No PDF loaded");
 
   console.log(`🚀 Extract started (${pdfDoc.numPages} pages)`);
 
-  // 1) Document fields (once, from current page)
   for (const field of DOCUMENT_DETAILS) {
     const region = getMostRecentRegionOfType(currentPage, field);
     if (!region) {
@@ -1180,10 +1488,16 @@ async function extractAll() {
     console.log(`📄 Document field (${field}) →`, (documentDetails[field] || "").trim() || "<empty>");
   }
 
-  // 2) Sheet fields on current page (promote to templates)
   for (const field of REGION_TYPES) {
     const region = getMostRecentRegionOfType(currentPage, field);
     if (!region) continue;
+
+    if (TEMPLATE_MASTER_PAGE === null) {
+      TEMPLATE_MASTER_PAGE = currentPage;
+      console.log(`📐 Master page set to: ${TEMPLATE_MASTER_PAGE}`);
+    }
+
+    promoteRegionToTemplate(region);
 
     let extracted = await extractOCRFromRegion(currentPage, region);
     extracted = (extracted || "").trim();
@@ -1199,18 +1513,9 @@ async function extractAll() {
       console.warn(`⚠️ Sheet field (master) (${field}) read empty; keeping existing value`, sheetDetailsByPage[currentPage][field]);
     }
 
-    if (TEMPLATE_MASTER_PAGE === null) {
-      TEMPLATE_MASTER_PAGE = currentPage;
-    }
-
-    if (currentPage === TEMPLATE_MASTER_PAGE) {
-      promoteRegionToTemplate(region);
-    }
-
     console.log(`📄 Sheet field (master) (${field}) →`, (sheetDetailsByPage[currentPage]?.[field] || "").trim() || "<empty>");
   }
 
-  // 3) Apply templates to all pages (progress in console)
   await applyTemplatesToAllPages(true);
 
   console.log("✅ Extract All complete");
@@ -1218,17 +1523,26 @@ async function extractAll() {
 
 window.extractAll = extractAll;
 
-/* ============================================================
-   DELETE / COPY / PASTE (multi-select)
-   ============================================================ */
-
 window.addEventListener("keydown", (e) => {
-  // Don't hijack shortcuts while typing in inputs
   if (isEditableTarget(document.activeElement)) return;
 
   const modKey = e.ctrlKey || e.metaKey;
 
-  // Copy
+  // UNDO: Ctrl/Cmd + Z (without Shift)
+  if (modKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+    undo();
+    e.preventDefault();
+    return;
+  }
+
+  // REDO: Ctrl/Cmd + Shift + Z
+  if (modKey && e.shiftKey && (e.key === "z" || e.key === "Z")) {
+    redo();
+    e.preventDefault();
+    return;
+  }
+
+  // COPY: Ctrl/Cmd + C
   if (modKey && (e.key === "c" || e.key === "C")) {
     if (selectedRegionIds.length) {
       copySelectionToClipboard();
@@ -1237,7 +1551,7 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Cut
+  // CUT: Ctrl/Cmd + X
   if (modKey && (e.key === "x" || e.key === "X")) {
     if (selectedRegionIds.length) {
       const didCopy = copySelectionToClipboard();
@@ -1247,6 +1561,9 @@ window.addEventListener("keydown", (e) => {
         const cutTypes = [...new Set(regions.filter(r => sel.has(r.id)).map(r => r.type))];
         regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
         invalidatePageFields(currentPage, cutTypes);
+        
+        saveUndoState(); // ADDED
+        
         clearSelection();
         redrawRegions();
         console.log(`✂️ Cut ${clipboardRegions.length} region(s) from page ${currentPage}`);
@@ -1256,7 +1573,7 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Paste
+  // PASTE: Ctrl/Cmd + V (Shift+V for paste at pointer)
   if (modKey && (e.key === "v" || e.key === "V")) {
     if (clipboardRegions.length) {
       if (e.shiftKey) {
@@ -1269,7 +1586,7 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Delete selection
+  // DELETE: Delete or Backspace key
   if (e.key === "Delete" || e.key === "Backspace") {
     if (!selectedRegionIds.length) return;
 
@@ -1278,63 +1595,50 @@ window.addEventListener("keydown", (e) => {
     const deletedTypes = [...new Set(regions.filter(r => sel.has(r.id)).map(r => r.type))];
     regionsByPage[currentPage] = regions.filter((r) => !sel.has(r.id));
     invalidatePageFields(currentPage, deletedTypes);
+    
+    saveUndoState(); // ADDED
+    
     clearSelection();
     redrawRegions();
     e.preventDefault();
   }
 });
 
-/* ============================================================
-   WHEEL: zoom + pan (zoom-to-cursor)
-   ============================================================ */
+pdfScroll?.addEventListener("wheel", (e) => {
+  e.preventDefault();
 
-pdfScroll?.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
+  if (e.shiftKey) return;
 
-    // Disable shift behaviour (reserved / buggy)
-    if (e.shiftKey) return;
+  const PAN_SPEED = 3;
+  const ZOOM_FACTOR = 1.1;
 
-    const PAN_SPEED = 3;
-    const ZOOM_FACTOR = 1.1;
+  if (e.ctrlKey) {
+    pdfScroll.scrollLeft += e.deltaY * PAN_SPEED;
+    return;
+  }
 
-    // Ctrl + wheel → horizontal pan
-    if (e.ctrlKey) {
-      pdfScroll.scrollLeft += e.deltaY * PAN_SPEED;
-      return;
-    }
+  if (e.altKey) {
+    pdfScroll.scrollTop += e.deltaY * PAN_SPEED;
+    return;
+  }
 
-    // Alt + wheel → vertical pan
-    if (e.altKey) {
-      pdfScroll.scrollTop += e.deltaY * PAN_SPEED;
-      return;
-    }
+  const rect = pdfScroll.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
 
-    // Normal wheel → zoom to cursor
-    const rect = pdfScroll.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
+  const px = (pdfScroll.scrollLeft + mx) / scale;
+  const py = (pdfScroll.scrollTop + my) / scale;
 
-    const px = (pdfScroll.scrollLeft + mx) / scale;
-    const py = (pdfScroll.scrollTop + my) / scale;
+  scale *= e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+  scale = Math.min(Math.max(scale, 0.3), 20.0); // Increased from 5 to 20
 
-    scale *= e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
-    scale = Math.min(Math.max(scale, 0.3), 5);
+  renderPage(currentPage);
 
-    renderPage(currentPage);
-
-    requestAnimationFrame(() => {
-      pdfScroll.scrollLeft = px * scale - mx;
-      pdfScroll.scrollTop = py * scale - my;
-    });
-  },
-  { passive: false }
-);
-
-/* ============================================================
-   EXPORT: canonical shape (document + sheets[])
-   ============================================================ */
+  requestAnimationFrame(() => {
+    pdfScroll.scrollLeft = px * scale - mx;
+    pdfScroll.scrollTop = py * scale - my;
+  });
+}, { passive: false });
 
 function getCanonicalExportData() {
   const doc = {
@@ -1345,18 +1649,27 @@ function getCanonicalExportData() {
   const sheets = [];
   const numPages = pdfDoc?.numPages || 0;
 
+  console.log(`📊 Generating export data for ${numPages} pages...`);
+
   for (let p = 1; p <= numPages; p++) {
     const s = sheetDetailsByPage[p] || {};
-    sheets.push({
+    const sheet = {
       page: p,
       sheet_id: (s.sheet_id || "").trim(),
       description: (s.description || "").trim(),
       issue_id: (s.issue_id || "").trim(),
       date: (s.date || "").trim(),
       issue_description: (s.issue_description || "").trim(),
-    });
+    };
+    sheets.push(sheet);
+    
+    const hasData = Object.values(sheet).slice(1).some(v => v !== "");
+    if (!hasData && p > 1) {
+      console.warn(`⚠️ Page ${p} has no extracted data (templates may not have been applied)`);
+    }
   }
 
+  console.log(`📊 Generated ${sheets.length} sheet records`);
   return { document: doc, sheets };
 }
 
@@ -1381,21 +1694,31 @@ function downloadBlob(blob, filename) {
 }
 
 window.downloadJSON = async function () {
+  console.log("📦 Starting JSON export...");
+  
   if (typeof applyTemplatesToAllPages === "function") {
     await applyTemplatesToAllPages(true);
   }
+  
   const data = getCanonicalExportData();
+  
+  console.log(`✅ Exporting ${data.sheets.length} pages`);
+  
   const json = JSON.stringify(data, null, 2);
   downloadBlob(new Blob([json], { type: "application/json" }), `${pdfFileBaseName}.json`);
-  console.log("⬇️ JSON exported", `${pdfFileBaseName}.json`);
+  console.log("⬇️ JSON exported:", `${pdfFileBaseName}.json`);
 };
 
 window.downloadCSV = async function () {
+  console.log("📦 Starting CSV export...");
+  
   if (typeof applyTemplatesToAllPages === "function") {
     await applyTemplatesToAllPages(true);
   }
 
   const { document, sheets } = getCanonicalExportData();
+  
+  console.log(`✅ Exporting ${sheets.length} pages`);
 
   const headers = [
     "prepared_by",
@@ -1427,5 +1750,5 @@ window.downloadCSV = async function () {
   ].join("\n");
 
   downloadBlob(new Blob([csv], { type: "text/csv" }), `${pdfFileBaseName}.csv`);
-  console.log("⬇️ CSV exported", `${pdfFileBaseName}.csv`);
+  console.log("⬇️ CSV exported:", `${pdfFileBaseName}.csv`);
 };

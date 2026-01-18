@@ -53,10 +53,108 @@ body {
   flex-wrap: wrap;
 }
 
-/* Small toolbar layout helpers */
+/* ---------- File Button (NEW) ---------- */
+#file-input {
+  /* Make it visible but styled nicely */
+  font-size: 11px;
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+}
+
+#file-input::-webkit-file-upload-button {
+  display: none;
+}
+
+.file-button {
+  padding: 8px 16px;
+  background: #007aff;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background 0.2s;
+  margin-right: 8px;
+}
+
+.file-button:hover {
+  background: #0051a8;
+}
+
+.file-button:active {
+  background: #003d7a;
+}
+
+/* ---------- PDF Tabs ---------- */
+.pdf-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: #f5f5f5;
+  border-radius: 4px;
+  max-width: 500px;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.pdf-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #e0e0e0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.pdf-tab:hover {
+  background: #d0d0d0;
+}
+
+.pdf-tab.active {
+  background: #007aff;
+  color: white;
+  border-color: #0051a8;
+}
+
+.pdf-tab-close {
+  margin-left: 4px;
+  font-size: 18px;
+  font-weight: bold;
+  color: #666;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.pdf-tab.active .pdf-tab-close {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.pdf-tab-close:hover {
+  background: rgba(0, 0, 0, 0.1);
+  color: #000;
+}
+
+.pdf-tab.active .pdf-tab-close:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+}
+
+/* ---------- Field Groups ---------- */
 .field-group {
   display: inline-flex;
-  flex-direction: row;      /* ✅ Prepared By + Project ID on one line */
+  flex-direction: row;
   align-items: center;
   gap: 16px;
   margin-right: 10px;
@@ -129,12 +227,7 @@ canvas {
 }
 
 /* ============================================================
-   Colour strategy (important but simple)
-   - Document fields:
-     prepared_by = blue, project_id = teal
-   - Sheet fields:
-     sheet_id = purple, description = green, issue_id = orange,
-     date = pink, issue_description = cyan
+   Colour strategy
    ============================================================ */
 
 /* Swatches */
