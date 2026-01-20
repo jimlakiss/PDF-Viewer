@@ -1,7 +1,7 @@
 // pdf_viewer.js - COMPLETE LATEST VERSION
 // Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
-const ENABLE_VECTOR_EXTRACTION = true;
+const ENABLE_VECTOR_EXTRACTION = false;
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 const REGION_TYPES = ["sheet_id", "description", "issue_id", "date", "issue_description"];
 
@@ -1127,7 +1127,14 @@ function resolveAllRegionsForPage(pageNum, type) {
   const pageRegions = regionsByPage[pageNum] || [];
   const overrides = pageRegions.filter((r) => r.type === type);
   
-  if (overrides.length > 0) return overrides;
+  if (overrides.length > 0) {
+    // Sort regions top-to-bottom, then left-to-right
+    return overrides.sort((a, b) => {
+      const yDiff = a.y - b.y;
+      if (Math.abs(yDiff) > 0.01) return yDiff; // Different rows
+      return a.x - b.x; // Same row, sort by x
+    });
+  }
   
   // Check if this ghost is excluded on this page
   if (ghostExclusions[pageNum] && ghostExclusions[pageNum].has(type)) {
