@@ -1,7 +1,7 @@
 // pdf_viewer.js - COMPLETE LATEST VERSION
 // Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
-const ENABLE_VECTOR_EXTRACTION = false;
+const ENABLE_VECTOR_EXTRACTION = true;
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 const REGION_TYPES = ["sheet_id", "description", "issue_id", "date", "issue_description"];
 
@@ -1123,6 +1123,22 @@ function resolveRegionForPage(pageNum, type) {
   return null;
 }
 
+function resolveAllRegionsForPage(pageNum, type) {
+  const pageRegions = regionsByPage[pageNum] || [];
+  const overrides = pageRegions.filter((r) => r.type === type);
+  
+  if (overrides.length > 0) return overrides;
+  
+  // Check if this ghost is excluded on this page
+  if (ghostExclusions[pageNum] && ghostExclusions[pageNum].has(type)) {
+    console.log(`⏭️ Page ${pageNum}: Skipping extraction for excluded ghost "${type}"`);
+    return []; // Don't extract if ghost was deleted
+  }
+  
+  if (regionTemplates[type]) return [regionTemplates[type]];
+  return [];
+}
+
 function promoteRegionToTemplate(region) {
   if (!region || !region.type) return;
   regionTemplates[region.type] = {
@@ -1478,27 +1494,40 @@ async function applyTemplatesToAllPages(logProgress = false) {
       for (const field of REGION_TYPES) {
         if (Object.prototype.hasOwnProperty.call(sheetDetailsByPage[pageNum], field)) continue;
 
-        const region = resolveRegionForPage(pageNum, field);
-        if (!region) {
+        const regions = resolveAllRegionsForPage(pageNum, field);
+        if (regions.length === 0) {
           console.warn(`⚠️ Page ${pageNum}: No region for "${field}"`);
           continue;
         }
 
-        let extracted = "";
+        let extractedParts = [];
 
-        if (ENABLE_VECTOR_EXTRACTION) {
-          extracted = await extractVectorTextFromRegion(pageNum, region);
+        for (const region of regions) {
+          let extracted = "";
+
+          if (ENABLE_VECTOR_EXTRACTION) {
+            extracted = await extractVectorTextFromRegion(pageNum, region);
+          }
+
+          if (!extracted) {
+            extracted = await extractOCRFromRegion(pageNum, region);
+          }
+
+          extracted = cleanByField(field, extracted);
+          if (extracted) {
+            extractedParts.push(extracted);
+          }
         }
 
-        if (!extracted) {
-          extracted = await extractOCRFromRegion(pageNum, region);
-        }
-
-        extracted = cleanByField(field, extracted);
-        sheetDetailsByPage[pageNum][field] = extracted || "";
+        const finalExtracted = extractedParts.join(" ");
+        sheetDetailsByPage[pageNum][field] = finalExtracted || "";
         
-        if (logProgress && extracted) {
-          console.log(`  ✓ Page ${pageNum} "${field}": "${extracted}"`);
+        if (logProgress && finalExtracted) {
+          if (extractedParts.length > 1) {
+            console.log(`  ✓ Page ${pageNum} "${field}": "${finalExtracted}" (from ${extractedParts.length} regions)`);
+          } else {
+            console.log(`  ✓ Page ${pageNum} "${field}": "${finalExtracted}"`);
+          }
         }
       }
     }
