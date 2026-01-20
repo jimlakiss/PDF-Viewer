@@ -1,7 +1,7 @@
 // pdf_viewer.js - COMPLETE LATEST VERSION
 // Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
-const ENABLE_VECTOR_EXTRACTION = true;
+const ENABLE_VECTOR_EXTRACTION = false;
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 const REGION_TYPES = ["sheet_id", "description", "issue_id", "date", "issue_description"];
 
@@ -725,17 +725,24 @@ function onRegionDragMove(evt) {
   const regs = regionsByPage[currentPage] || [];
   const byId = new Map(regs.map(r => [r.id, r]));
   dragStartById.forEach((s, id) => {
-    const r = byId.get(id);
-    if (!r) return;
+  const r = byId.get(id);
+  if (!r) return;
+  
+  // If dragging a ghost, convert to real region FIRST with new values
+  if (r.isGhost) {
+    // Create a proper copy, don't modify the template
+    const newX = s.x + dx;
+    const newY = s.y + dy;
+    
+    r.x = newX;
+    r.y = newY;
+    delete r.isGhost;
+    console.log(`👻→✓ Converting ghost "${r.type}" to real region at (${(newX*100).toFixed(1)}%, ${(newY*100).toFixed(1)}%)`);
+  } else {
     r.x = s.x + dx;
     r.y = s.y + dy;
-    
-    // If dragging a ghost, convert it to a real region immediately
-    if (r.isGhost) {
-      delete r.isGhost;
-      console.log(`👻→✓ Converting ghost "${r.type}" to real region (dragging)`);
-    }
-  });
+  }
+});
 
   redrawRegions();
 }
@@ -819,10 +826,17 @@ if (REGION_TYPES.includes(region.type)) {
   if (TEMPLATE_MASTER_PAGE === null) {
     TEMPLATE_MASTER_PAGE = currentPage;
     console.log(`📐 Master page set to: ${TEMPLATE_MASTER_PAGE}`);
-  }
     promoteRegionToTemplate(region);
-    console.log(`✨ Auto-promoted "${region.type}" to template`);
+    console.log(`✨ Auto-promoted "${region.type}" to template (first region of this type)`);
+  } else if (currentPage === TEMPLATE_MASTER_PAGE) {
+    // On master page - update template
+    promoteRegionToTemplate(region);
+    console.log(`✨ Updated template for "${region.type}" (drawing on master page)`);
+  } else {
+    // Not on master page - create page-specific override only
+    console.log(`📍 Created page-specific override for "${region.type}" on page ${currentPage} (not master page)`);
   }
+}
   redrawRegions();
 });
 
@@ -1015,8 +1029,10 @@ function pasteClipboardToCurrentPage() {
     if (REGION_TYPES.includes(newRegion.type)) {
       if (TEMPLATE_MASTER_PAGE === null) {
         TEMPLATE_MASTER_PAGE = currentPage;
+        promoteRegionToTemplate(newRegion);
+      } else if (currentPage === TEMPLATE_MASTER_PAGE) {
+        promoteRegionToTemplate(newRegion);
       }
-      promoteRegionToTemplate(newRegion);
     }
     newIds.push(id);
   });
@@ -1070,8 +1086,10 @@ function pasteClipboardToCurrentPageAtPointer() {
     if (REGION_TYPES.includes(newRegion.type)) {
       if (TEMPLATE_MASTER_PAGE === null) {
         TEMPLATE_MASTER_PAGE = currentPage;
+        promoteRegionToTemplate(newRegion);
+      } else if (currentPage === TEMPLATE_MASTER_PAGE) {
+        promoteRegionToTemplate(newRegion);
       }
-      promoteRegionToTemplate(newRegion);
     }
     newIds.push(id);
   });
@@ -1500,7 +1518,7 @@ window.applyTemplatesToAllPages = applyTemplatesToAllPages;
 async function extractAll() {
   if (!pdfDoc) return alert("No PDF loaded");
 
-  console.log(`🚀 Extract started (${pdfDoc.numPages} pages)`);
+  console.log(`🚀 Extract started - extracting DOCUMENT_DETAILS only (prepared_by, project_id)`);
 
   for (const field of DOCUMENT_DETAILS) {
     const region = getMostRecentRegionOfType(currentPage, field);
@@ -1523,37 +1541,8 @@ async function extractAll() {
     console.log(`📄 Document field (${field}) →`, (documentDetails[field] || "").trim() || "<empty>");
   }
 
-  for (const field of REGION_TYPES) {
-    const region = getMostRecentRegionOfType(currentPage, field);
-    if (!region) continue;
-
-    if (TEMPLATE_MASTER_PAGE === null) {
-      TEMPLATE_MASTER_PAGE = currentPage;
-      console.log(`📐 Master page set to: ${TEMPLATE_MASTER_PAGE}`);
-    }
-
-    promoteRegionToTemplate(region);
-
-    let extracted = await extractOCRFromRegion(currentPage, region);
-    extracted = (extracted || "").trim();
-
-    if (!sheetDetailsByPage[currentPage]) sheetDetailsByPage[currentPage] = {};
-    const hadValue = Object.prototype.hasOwnProperty.call(sheetDetailsByPage[currentPage], field) && (sheetDetailsByPage[currentPage][field] || "").trim();
-    if (extracted) {
-      sheetDetailsByPage[currentPage][field] = extracted;
-    } else if (!hadValue) {
-      sheetDetailsByPage[currentPage][field] = "";
-      console.warn(`⚠️ Sheet field (master) (${field}) read empty`);
-    } else {
-      console.warn(`⚠️ Sheet field (master) (${field}) read empty; keeping existing value`, sheetDetailsByPage[currentPage][field]);
-    }
-
-    console.log(`📄 Sheet field (master) (${field}) →`, (sheetDetailsByPage[currentPage]?.[field] || "").trim() || "<empty>");
-  }
-
-  await applyTemplatesToAllPages(true);
-
-  console.log("✅ Extract All complete");
+  console.log("✅ Extract complete (DOCUMENT_DETAILS only)");
+  console.log("ℹ️ REGION_TYPES (sheet_id, description, etc.) are NOT extracted - they use templates/overrides automatically");
 }
 
 window.extractAll = extractAll;
@@ -1633,7 +1622,7 @@ window.addEventListener("keydown", (e) => {
   
   selectedRegions.forEach(region => {
     if (region.isGhost) {
-      // RULE 2: Delete ghost on this page only - add to exclusion list
+      // RULE 1: Delete ghost on this page only - add to exclusion list
       console.log(`🗑️ Hiding ghost "${region.type}" on page ${currentPage}`);
       
       if (!ghostExclusions[currentPage]) {
@@ -1644,9 +1633,9 @@ window.addEventListener("keydown", (e) => {
       regionsByPage[currentPage] = regionsByPage[currentPage].filter(r => r.id !== region.id);
       invalidatePageFields(currentPage, [region.type]);
       
-    } else {
-      // RULE 1: Delete main shape from templates (removes from all pages)
-      console.log(`🗑️ Deleting main shape "${region.type}" from ALL pages`);
+    } else if (currentPage === TEMPLATE_MASTER_PAGE) {
+      // RULE 2: Delete from master page - removes template and all instances
+      console.log(`🗑️ Deleting "${region.type}" from MASTER PAGE - removing from ALL pages`);
       
       if (regionTemplates[region.type]) {
         delete regionTemplates[region.type];
@@ -1656,6 +1645,13 @@ window.addEventListener("keydown", (e) => {
         regionsByPage[pageNum] = regionsByPage[pageNum].filter(r => r.type !== region.type);
         invalidatePageFields(parseInt(pageNum), [region.type]);
       });
+      
+    } else {
+      // RULE 3: Delete page-specific override - only removes from this page
+      console.log(`🗑️ Deleting page-specific override "${region.type}" from page ${currentPage} only`);
+      
+      regionsByPage[currentPage] = regionsByPage[currentPage].filter(r => r.id !== region.id);
+      invalidatePageFields(currentPage, [region.type]);
     }
   });
   
@@ -1754,62 +1750,127 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
+// Processing indicator functions
+function showProcessing(message) {
+  const existing = document.getElementById('processing-overlay');
+  if (existing) existing.remove();
+  
+  const overlay = document.createElement('div');
+  overlay.id = 'processing-overlay';
+  overlay.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+    font-family: sans-serif;
+  `;
+  
+  const messageBox = document.createElement('div');
+  messageBox.style.cssText = `
+    background: white;
+    padding: 30px 50px;
+    border-radius: 8px;
+    font-size: 18px;
+    font-weight: 500;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  `;
+  messageBox.textContent = message;
+  
+  overlay.appendChild(messageBox);
+  document.body.appendChild(overlay);
+  
+  // Disable export buttons
+  const buttons = document.querySelectorAll('button[onclick*="download"]');
+  buttons.forEach(btn => btn.disabled = true);
+}
+
+function hideProcessing() {
+  const overlay = document.getElementById('processing-overlay');
+  if (overlay) overlay.remove();
+  
+  // Re-enable export buttons
+  const buttons = document.querySelectorAll('button[onclick*="download"]');
+  buttons.forEach(btn => btn.disabled = false);
+}
+
 window.downloadJSON = async function () {
-  console.log("📦 Starting JSON export...");
-  
-  if (typeof applyTemplatesToAllPages === "function") {
-    await applyTemplatesToAllPages(true);
+  try {
+    showProcessing('Processing JSON export...');
+    console.log("📦 Starting JSON export...");
+    
+    if (typeof applyTemplatesToAllPages === "function") {
+      await applyTemplatesToAllPages(true);
+    }
+    
+    const data = getCanonicalExportData();
+    
+    console.log(`✅ Exporting ${data.sheets.length} pages`);
+    
+    const json = JSON.stringify(data, null, 2);
+    downloadBlob(new Blob([json], { type: "application/json" }), `${pdfFileBaseName}.json`);
+    console.log("⬇️ JSON exported:", `${pdfFileBaseName}.json`);
+  } catch (error) {
+    console.error("❌ JSON export error:", error);
+    alert("Error exporting JSON: " + error.message);
+  } finally {
+    hideProcessing();
   }
-  
-  const data = getCanonicalExportData();
-  
-  console.log(`✅ Exporting ${data.sheets.length} pages`);
-  
-  const json = JSON.stringify(data, null, 2);
-  downloadBlob(new Blob([json], { type: "application/json" }), `${pdfFileBaseName}.json`);
-  console.log("⬇️ JSON exported:", `${pdfFileBaseName}.json`);
 };
 
 window.downloadCSV = async function () {
-  console.log("📦 Starting CSV export...");
-  
-  if (typeof applyTemplatesToAllPages === "function") {
-    await applyTemplatesToAllPages(true);
+  try {
+    showProcessing('Processing CSV export...');
+    console.log("📦 Starting CSV export...");
+    
+    if (typeof applyTemplatesToAllPages === "function") {
+      await applyTemplatesToAllPages(true);
+    }
+
+    const { document, sheets } = getCanonicalExportData();
+    
+    console.log(`✅ Exporting ${sheets.length} pages`);
+
+    const headers = [
+      "prepared_by",
+      "project_id",
+      "page",
+      "sheet_id",
+      "description",
+      "issue_id",
+      "date",
+      "issue_description",
+    ];
+
+    const rows = sheets.map((s) => [
+      document.prepared_by,
+      document.project_id,
+      s.page,
+      s.sheet_id,
+      s.description,
+      s.issue_id,
+      s.date,
+      s.issue_description,
+    ]);
+
+    const csv = [
+      headers.join(","),
+      ...rows.map((r) =>
+        r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")
+      ),
+    ].join("\n");
+
+    downloadBlob(new Blob([csv], { type: "text/csv" }), `${pdfFileBaseName}.csv`);
+    console.log("⬇️ CSV exported:", `${pdfFileBaseName}.csv`);
+  } catch (error) {
+    console.error("❌ CSV export error:", error);
+    alert("Error exporting CSV: " + error.message);
+  } finally {
+    hideProcessing();
   }
-
-  const { document, sheets } = getCanonicalExportData();
-  
-  console.log(`✅ Exporting ${sheets.length} pages`);
-
-  const headers = [
-    "prepared_by",
-    "project_id",
-    "page",
-    "sheet_id",
-    "description",
-    "issue_id",
-    "date",
-    "issue_description",
-  ];
-
-  const rows = sheets.map((s) => [
-    document.prepared_by,
-    document.project_id,
-    s.page,
-    s.sheet_id,
-    s.description,
-    s.issue_id,
-    s.date,
-    s.issue_description,
-  ]);
-
-  const csv = [
-    headers.join(","),
-    ...rows.map((r) =>
-      r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")
-    ),
-  ].join("\n");
-
-  downloadBlob(new Blob([csv], { type: "text/csv" }), `${pdfFileBaseName}.csv`);
-  console.log("⬇️ CSV exported:", `${pdfFileBaseName}.csv`);
 };
