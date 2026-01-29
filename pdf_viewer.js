@@ -1245,6 +1245,49 @@ function _normText(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Disambiguates between digit 0 and letter O based on surrounding context
+ * Uses heuristics: if surrounded by digits, likely a 0; if by letters, likely an O
+ */
+function disambiguate0AndO(text) {
+  if (!text) return text;
+
+  let result = text;
+
+  // Replace ambiguous characters based on neighbors
+  result = result.replace(/[O0]/g, (match, offset) => {
+    const prev = offset > 0 ? text[offset - 1] : '';
+    const next = offset < text.length - 1 ? text[offset + 1] : '';
+
+    const prevIsDigit = /[1-9]/.test(prev);
+    const nextIsDigit = /[1-9]/.test(next);
+    const prevIsLetter = /[A-Za-z]/.test(prev);
+    const nextIsLetter = /[A-Za-z]/.test(next);
+
+    // Strong evidence for digit 0
+    if (prevIsDigit && nextIsDigit) return '0';
+    if (prevIsDigit && !nextIsLetter) return '0';
+    if (nextIsDigit && !prevIsLetter) return '0';
+
+    // Strong evidence for letter O
+    if (prevIsLetter && nextIsLetter) return 'O';
+    if (prevIsLetter && !nextIsDigit) return 'O';
+    if (nextIsLetter && !prevIsDigit) return 'O';
+
+    // Default: keep as-is or prefer based on position
+    // At start of string: if next is letter, use O; if next is digit, use 0
+    if (offset === 0) {
+      if (nextIsLetter) return 'O';
+      if (nextIsDigit) return '0';
+    }
+
+    // Keep original character if no clear context
+    return match;
+  });
+
+  return result;
+}
+
 function cleanByField(field, raw) {
   const t = _normText(raw);
   if (!t) return "";
@@ -1261,8 +1304,17 @@ function cleanByField(field, raw) {
   }
 
   if (field === "sheet_id") {
-    const m = t.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
-    return m ? m[0] : t;
+    // Apply 0/O disambiguation before pattern matching
+    const disambiguated = disambiguate0AndO(t);
+    const m = disambiguated.match(/[A-Za-z0-9][A-Za-z0-9\-_.]*/);
+    const result = m ? m[0] : disambiguated;
+
+    // Log if disambiguation made changes (for debugging)
+    if (t !== disambiguated) {
+      console.log(`🔍 sheet_id disambiguation: "${t}" → "${result}"`);
+    }
+
+    return result;
   }
 
   if (field === "project_id") {
@@ -1276,10 +1328,10 @@ function cleanByField(field, raw) {
 function _ocrPassConfigs(field) {
   if (field === "sheet_id" || field === "issue_id" || field === "project_id") {
     return [
-      { psm: "7", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "line" },
-      { psm: "8", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "word" },
-      { psm: "6", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "block" },
-      { psm: "13", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/", label: "raw-line" },
+      { psm: "7", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/()", label: "line" },
+      { psm: "8", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/()", label: "word" },
+      { psm: "6", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/()", label: "block" },
+      { psm: "13", whitelist: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.\/()", label: "raw-line" },
     ];
   }
 
@@ -1873,9 +1925,9 @@ window.downloadCSV = async function () {
     console.log(`✅ Exporting ${sheets.length} pages`);
 
     const headers = [
+      "page",
       "prepared_by",
       "project_id",
-      "page",
       "sheet_id",
       "description",
       "issue_id",
@@ -1884,9 +1936,9 @@ window.downloadCSV = async function () {
     ];
 
     const rows = sheets.map((s) => [
+      s.page,
       document.prepared_by,
       document.project_id,
-      s.page,
       s.sheet_id,
       s.description,
       s.issue_id,
