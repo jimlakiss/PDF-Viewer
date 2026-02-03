@@ -266,3 +266,34 @@ rect[data-type="issue_description"] { stroke: #5ac8fa; fill: #5ac8fa; }
   align-items: center;
   gap: 8px;
 }
+
+/* ---------- Toolbar Buttons ---------- */
+#toolbar button {
+  padding: 6px 12px;
+  font-size: 12px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #f0f0f0;
+  color: #333;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#toolbar button:hover {
+  background: #e0e0e0;
+}
+
+/* Toggle button (Vector) - OFF state uses base styles, ON state is green */
+#toolbar .toggle-btn {
+  color: #666;
+}
+
+#toolbar .toggle-btn.active {
+  background: #34c759;
+  color: white;
+  border-color: #2da44e;
+}
+
+#toolbar .toggle-btn.active:hover {
+  background: #2da44e;
+}

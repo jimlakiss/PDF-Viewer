@@ -1,7 +1,7 @@
 // pdf_viewer.js - COMPLETE LATEST VERSION
 // Multi-page PDF viewer + region drawing + vector/OCR extraction + multi-file support
 
-const ENABLE_VECTOR_EXTRACTION = false;
+let ENABLE_VECTOR_EXTRACTION = false;
 const DOCUMENT_DETAILS = ["prepared_by", "project_id"];
 const REGION_TYPES = ["sheet_id", "description", "issue_id", "date", "issue_description"];
 
@@ -426,6 +426,15 @@ preparedByInput?.addEventListener("input", () => {
 
 projectIdInput?.addEventListener("input", () => {
   documentDetails.project_id = projectIdInput.value || "";
+});
+
+// Extraction mode toggle button (Vector + OCR vs Image OCR only)
+const vectorToggleBtn = document.getElementById("vector-toggle");
+vectorToggleBtn?.addEventListener("click", () => {
+  ENABLE_VECTOR_EXTRACTION = !ENABLE_VECTOR_EXTRACTION;
+  vectorToggleBtn.textContent = ENABLE_VECTOR_EXTRACTION ? "Vector: ON" : "Vector: OFF";
+  vectorToggleBtn.classList.toggle("active", ENABLE_VECTOR_EXTRACTION);
+  console.log(`🔧 Extraction mode: ${ENABLE_VECTOR_EXTRACTION ? "Vector + OCR" : "Image OCR only"}`);
 });
 
 async function renderPage(pageNum) {
