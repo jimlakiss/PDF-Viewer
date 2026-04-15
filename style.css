@@ -286,8 +286,11 @@ rect[data-type="issue_description"] { stroke: #5ac8fa; fill: #5ac8fa; }
 .toolbar-brand-logo {
   height: 32px;
   width: 32px;
+  max-height: 32px;
+  max-width: 32px;
   object-fit: contain;
   flex: 0 0 auto;
+  display: block;
 }
 
 .toolbar-brand-text {
