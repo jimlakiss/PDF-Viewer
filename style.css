@@ -53,20 +53,6 @@ body {
   flex-wrap: wrap;
 }
 
-#toolbar button {
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid #c8c8c8;
-  border-radius: 4px;
-  background: #fff;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-#toolbar button:hover {
-  background: #f4f4f4;
-}
-
 /* ---------- File Button (NEW) ---------- */
 #file-input {
   /* Make it visible but styled nicely */
