@@ -53,6 +53,20 @@ body {
   flex-wrap: wrap;
 }
 
+#toolbar button {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid #c8c8c8;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#toolbar button:hover {
+  background: #f4f4f4;
+}
+
 /* ---------- File Button (NEW) ---------- */
 #file-input {
   /* Make it visible but styled nicely */
@@ -259,6 +273,42 @@ rect[data-type="issue_description"] { stroke: #5ac8fa; fill: #5ac8fa; }
 /* ---------- Toolbar alignment helpers ---------- */
 .toolbar-spacer {
   flex: 1 1 auto;
+}
+
+.toolbar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.toolbar-brand-logo {
+  height: 32px;
+  width: 32px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.toolbar-brand-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.toolbar-brand-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #111;
+}
+
+.toolbar-brand-tagline {
+  font-size: 12px;
+  font-style: italic;
+  color: #4a4a4a;
+  white-space: nowrap;
 }
 
 .toolbar-right {
